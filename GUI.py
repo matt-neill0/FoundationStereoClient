@@ -150,7 +150,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.fps = QtWidgets.QDoubleSpinBox(); self.fps.setRange(0, 240); self.fps.setValue(10); self.fps.setSingleStep(1)
         self.jpeg_quality = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); self.jpeg_quality.setRange(50, 100); self.jpeg_quality.setValue(90)
-        self.jpeg_label = QtWidgets.QLabel("JPEG Quality: 90    (size fixed: 480x640)")
+        self.jpeg_label = QtWidgets.QLabel("JPEG Quality: 90")
 
         self.output_mode = QtWidgets.QComboBox(); self.output_mode.addItems(["Disparity", "Depth"])
         self.depth_group = QtWidgets.QGroupBox("Depth Options")
@@ -277,7 +277,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
         btns.rejected.connect(dlg.reject)
         btns.accepted.connect(dlg.accept)
-        v.addWidgets(btns)
+        v.addWidget(btns)
 
         dlg.exec()
 

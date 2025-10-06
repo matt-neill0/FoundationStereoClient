@@ -20,11 +20,24 @@ def encode_jpeg(img: np.ndarray, quality: int = 90) -> bytes:
         raise RuntimeError("cv2.imencode failed")
     return buf.tobytes()
 
-def read_next_pair_from_caps(capL: cv2.VideoCapture, capR: cv2.VideoCapture) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    okL, frameL = capL.read()
-    okR, frameR = capR.read()
-    if not (okL and okR):
+def read_next_pair_from_caps(capL: cv2.VideoCapture, capR: cv2.VideoCapture, retries: int = 2, backoff_s: float = 0.005) -> tuple | None:
+    def _read_with_retry(cap: cv2.VideoCapture) -> tuple[bool, any]:
+        ok, frame = cap.read()
+        tries = 0
+        while (not ok or frame is None) and tries < retries:
+            time.sleep(backoff_s)
+            ok, frame = cap.read()
+            tries += 1
+        return ok, frame
+
+    okL, frameL = _read_with_retry(capL)
+    if not okL or frameL is None:
         return None
+
+    okR, frameR = _read_with_retry(capR)
+    if not okR or frameR is None:
+        return None
+
     return frameL, frameR
 
 def read_next_pair_from_files(capL: cv2.VideoCapture, capR: cv2.VideoCapture, skip_once: bool = True):
@@ -145,8 +158,8 @@ class StereoSenderClient:
 
     async def start_stream(self, left_src: str, right_src: str, mode: str):
         if mode == "stream":
-            capL = open_cam(int(left_src), self.frame_width, self.frame_height, self.fps, self._on_log)
-            capR = open_cam(int(right_src), self.frame_width, self.frame_height, self.fps, self._on_log)
+            capL = open_cam(int(left_src), self.frame_height, self.frame_width, self.fps, self._on_log)
+            capR = open_cam(int(right_src), self.frame_height, self.frame_width, self.fps, self._on_log)
             if capL is None or capR is None:
                 self._on_log("[stream] could not open one or both cameras; stopping.")
                 self._on_finish()
