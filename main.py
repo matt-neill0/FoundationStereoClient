@@ -1,10 +1,16 @@
 import argparse, pathlib, time, os, sys, asyncio
 from sender_core import StereoSenderClient
 
+ALLOWED_RESOLUTIONS = ["320 x 240", "426 x 240", "480 x 360", "640 x 360", "640 x 480", "848 x 480", "960 x 720", "1280 x 720"]
+
+def parse_res_label(label: str) -> tuple[int, int]:
+    w_str, h_str = label.split("x")
+    return int(w_str.strip()), int(h_str.strip())
+
 def build_arg_parser():
-    p = argparse.ArgumentParser(description="Stereo sender (fixed 480x640). Use --gui to launch desktop app.")
+    p = argparse.ArgumentParser(description="Stereo sender. Use --gui to launch desktop app.")
     p.add_argument("--gui", action="store_true", help="Launch the GUI.")
-    p.add_argument("--host", default="jetson.local")
+    p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--path", default="/foundation-stereo")
     p.add_argument("--left-cam", type=int)
@@ -13,6 +19,7 @@ def build_arg_parser():
     p.add_argument("--right-file")
     p.add_argument("--fps", type=float, default=10.0)
     p.add_argument("--jpeg-quality", type=int, default=90)
+    p.add_argument("--resolution", choices=ALLOWED_RESOLUTIONS, default="640 x 480", help="Live stream resolution (WxH)")
     p.add_argument("--session-id", default=None)
     p.add_argument("--save-dir", default=None)
     p.add_argument("--preview", action="store_true")
@@ -34,6 +41,7 @@ def main_cli(args):
     client = StereoSenderClient(
         args.host, args.port, args.path,
         args.fps, args.jpeg_quality, session_id,
+        frame_width=args.frame_width, frame_height=args.frame_h,
         save_dir=save_dir, preview=args.preview,
         on_log=lambda s: print(s),
         on_result=lambda *a: print(f"[result] seq={a[0]} kind={a[1]} enc={a[2]} {a[3]}x{a[4]} bytes={len(a[5])}"),

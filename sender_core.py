@@ -1,11 +1,18 @@
-import asyncio, json, time, contextlib, pathlib
+import asyncio, json, time, contextlib, pathlib, os
 from typing import Optional, Tuple, Callable, Dict, Any
 import cv2
 import numpy as np
 import websockets
 
-FRAME_HEIGHT = 640
-FRAME_WIDTH = 480
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 480
+
+def logprint(cb, msg: str):
+    try:
+        if cb: cb(msg)
+        else: print(msg)
+    except Exception:
+        print(msg)
 
 def encode_jpeg(img: np.ndarray, quality: int = 90) -> bytes:
     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
@@ -20,6 +27,43 @@ def read_next_pair_from_caps(capL: cv2.VideoCapture, capR: cv2.VideoCapture) -> 
         return None
     return frameL, frameR
 
+def read_next_pair_from_files(capL: cv2.VideoCapture, capR: cv2.VideoCapture, skip_once: bool = True):
+    okL, frameL = capL.read()
+    okR, frameR = capR.read()
+
+    if okL and okR and frameL is not None and frameR is not None:
+        return frameL, frameR
+
+    if not skip_once:
+        return None
+
+    if not okL or frameL is None:
+        okL, frameL = capL.read()
+    if not okR or frameR is None:
+        okR, frameR = capR.read()
+
+    if okL and okR and frameL is not None and frameR is not None:
+        return frameL, frameR
+
+    return None
+
+def open_cam(idx: int, height: int, width: int, target_fps: float | None, on_log=None) -> cv2.VideoCapture | None:
+    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        logprint(on_log, f"[camera] failed to open index {idx}")
+        return None
+    with contextlib.suppress(Exception):
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"MJPG"))
+    if target_fps:
+        cap.set(cv2.CAP_PROP_FPS, float(target_fps))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    got_fps = cap.get(cv2.CAP_PROP_FPS)
+    logprint(on_log, f"[camera {idx}] requested {width}x{height} @ {target_fps or 'auto'}fps -> got {got_w}x{got_h} @ {got_fps:.2f}fps")
+    return cap
+
 class StereoSenderClient:
     def __init__(
             self,
@@ -29,6 +73,8 @@ class StereoSenderClient:
             fps: float,
             jpeg_quality: int,
             session_id: str,
+            frame_width: int = DEFAULT_WIDTH,
+            frame_height: int = DEFAULT_HEIGHT,
             save_dir: Optional[pathlib.Path] = None,
             preview: bool = False,
             on_log: Optional[Callable[[str], None]] = None,
@@ -42,6 +88,8 @@ class StereoSenderClient:
         self.fps = fps
         self.jpeg_quality = jpeg_quality
         self.session_id = session_id
+        self.frame_width = int(frame_width)
+        self.frame_height = int(frame_height)
         self.save_dir = save_dir
         self.preview = preview
 
@@ -97,12 +145,12 @@ class StereoSenderClient:
 
     async def start_stream(self, left_src: str, right_src: str, mode: str):
         if mode == "stream":
-            capL = cv2.VideoCapture(int(left_src))
-            capR = cv2.VideoCapture(int(right_src))
-            if self.fps:
-                for c in (capL, capR):
-                    c.set(cv2.CAP_PROP_FPS, self.fps)
-
+            capL = open_cam(int(left_src), self.frame_width, self.frame_height, self.fps, self._on_log)
+            capR = open_cam(int(right_src), self.frame_width, self.frame_height, self.fps, self._on_log)
+            if capL is None or capR is None:
+                self._on_log("[stream] could not open one or both cameras; stopping.")
+                self._on_finish()
+                return
         else:
             capL = cv2.VideoCapture(left_src)
             capR = cv2.VideoCapture(right_src)
@@ -110,7 +158,7 @@ class StereoSenderClient:
         uri = f"ws://{self.host}:{self.port}{self.path}"
         self.log(f"Connecting to {uri} ...")
 
-        async with websockets.connect(uri, max_size = None, ping_interval = 20, ping_timeout = 20) as ws:
+        async with websockets.connect(uri, max_size=None, ping_interval=20, ping_timeout=20) as ws:
             self._ws = ws
             await self._handshake()
             self.log("Handshake OK.")
@@ -118,51 +166,63 @@ class StereoSenderClient:
             start_msg = {
                 "type": "start", "mode": mode, "fmt": "jpeg",
                 "fps": float(self.fps) if self.fps else None,
-                "width": FRAME_WIDTH, "height": FRAME_HEIGHT,
+                "width": self.frame_width, "height": self.frame_height,
                 "meta": {"session_id": self.session_id}
             }
-        await ws.send(json.dumps(start_msg))
+            await ws.send(json.dumps(start_msg))
 
-        self._recv_task = asyncio.create_task(self._receiver_loop())
-        self._on_start()
+            self._recv_task = asyncio.create_task(self._receiver_loop())
+            self._on_start()
 
-        seq = 0
-        frame_interval = (1.0/self.fps) if (self.fps and self.fps > 0) else 0.0
-        next_t = time.perf_counter()
+            seq = 0
+            frame_interval = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.0
+            next_t = time.perf_counter()
 
-        while not self._stop_flag.is_set():
-            pair = read_next_pair_from_caps(capL, capR)
-            if pair is None:
-                self.log("End of source(s).")
-                break
-            frameL, frameR = pair
-            frameL = cv2.resize(frameL, (FRAME_WIDTH, FRAME_HEIGHT), interpolation = cv2.INTER_AREA)
-            frameR = cv2.resize(frameR, (FRAME_WIDTH, FRAME_HEIGHT), interpolation = cv2.INTER_AREA)
-            jpegL = encode_jpeg(frameL, self.jpeg_quality)
-            jpegR = encode_jpeg(frameR, self.jpeg_quality)
+            try:
+                while not self._stop_flag.is_set():
+                    pair = read_next_pair_from_caps(capL, capR) if mode=="stream" else read_next_pair_from_files(capL, capR)
+                    if pair is None:
+                        self.log("End of source(s).")
+                        if mode == "stream":
+                            okL, _ = capL.read()
+                            okR, _ = capR.read()
+                            self._on_log(f"End of Source(s). camL ok? {okL} camR ok? {okR}")
+                        else:
+                            self._on_log(f"End of Source(s).")
+                        break
+                    frameL, frameR = pair
+                    frameL = cv2.resize(frameL, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA)
+                    frameR = cv2.resize(frameR, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA)
+                    jpegL = encode_jpeg(frameL, self.jpeg_quality)
+                    jpegR = encode_jpeg(frameR, self.jpeg_quality)
 
-            ts_ns = time.time_ns()
-            meta = {"type":"frame", "ts":ts_ns, "seq":seq,
-                    "left_bytes":len(jpegL), "right_bytes": len(jpegR)}
-            await ws.send(json.dumps(meta))
-            await ws.send(jpegL)
-            await ws.send(jpegR)
-            seq += 1
+                    payload = {
+                        "type": "frame",
+                        "seq": seq, "ts": time.time(),
+                        "left": {"w": self.frame_width, "h": self.frame_height, "jpeg": len(jpegL)},
+                        "right": {"w": self.frame_width, "h": self.frame_height, "jpeg": len(jpegR)},
+                    }
+                    await ws.send(json.dumps(payload))
+                    await ws.send(jpegL)
+                    await ws.send(jpegR)
+                    seq += 1
 
-            if frame_interval > 0:
-                next_t += frame_interval
-                sleep_s = next_t - time.perf_counter()
-                if sleep_s > 0:
-                    await asyncio.sleep(sleep_s)
-
-        with contextlib.suppress(Exception):
-            await ws.send(json.dumps({"type": "end"}))
-        if self._recv_task:
-            self._recv_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._recv_task
-
-        self._on_finish()
+                    if frame_interval > 0:
+                        next_t += frame_interval
+                        sleep_s = next_t - time.perf_counter()
+                        if sleep_s > 0:
+                            await asyncio.sleep(sleep_s)
+            finally:
+                with contextlib.suppress(Exception):
+                    await ws.send(json.dumps({"type": "end"}))
+                if self._recv_task:
+                    self._recv_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await self._recv_task
+                with contextlib.suppress(Exception):
+                    if mode == "stream":
+                        capL.release(); capR.release()
+                self._on_finish()
 
     def stop(self):
         self._stop_flag.set()

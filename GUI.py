@@ -99,10 +99,10 @@ def try_get_realsense_fx_baseline() -> Optional [Tuple[float, float]]:
         return None
 
 class ClientWorker(QtCore.QThread):
-    logSignal = QtCore.Signal(str)
-    resultSignal = QtCore.Signal(int, str, str, int, int, bytes, dict)
-    startSignal = QtCore.Signal()
-    finishSignal = QtCore.Signal()
+    log_signal = QtCore.Signal(str)
+    result_signal = QtCore.Signal(int, str, str, int, int, bytes, dict)
+    start_signal = QtCore.Signal()
+    finish_signal = QtCore.Signal()
 
     def __init__(self, client: StereoSenderClient, left_src: str, right_src, mode: str):
         super().__init__()
@@ -142,6 +142,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right_cam = QtWidgets.QSpinBox(); self.right_cam.setRange(0, 9); self.right_cam.setValue(1)
         self.show_cams_btn = QtWidgets.QPushButton("Show Cameras")
 
+        self.res_preset = QtWidgets.QComboBox()
+        self.res_preset.addItems(["320 x 240", "426 x 240", "480 x 360", "640 x 360", "640 x 480", "848 x 480", "960 x 720", "1280 x 720"])
+
         self.left_file = QtWidgets.QLineEdit(); self.left_browse = QtWidgets.QPushButton("Browse...")
         self.right_file = QtWidgets.QLineEdit(); self.right_browse = QtWidgets.QPushButton("Browse...")
 
@@ -179,7 +182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         r = 0
         layout.addWidget(QtWidgets.QLabel("Host"), r, 0); layout.addWidget(self.host, r, 1)
         layout.addWidget(QtWidgets.QLabel("Port"), r, 2); layout.addWidget(self.port, r, 3)
-        layout.addWidget(QtWidgets.QLabel("Path"), r, 4); layout.addWidget(self.port, r, 5); r += 1
+        layout.addWidget(QtWidgets.QLabel("Path"), r, 4); layout.addWidget(self.path, r, 5); r += 1
 
         layout.addWidget(QtWidgets.QLabel("Source"), r, 0); layout.addWidget(self.src_mode, r, 1, 1, 2); r += 1
 
@@ -190,6 +193,12 @@ class MainWindow(QtWidgets.QMainWindow):
         cam_box.addStretch(1)
         cam_box.addWidget(self.show_cams_btn)
         layout.addLayout(cam_box, r, 0, 1, 6); r += 1
+
+        res_box = QtWidgets.QHBoxLayout()
+        res_box.addWidget(QtWidgets.QLabel("Resolution"))
+        res_box.addWidget(self.res_preset)
+        res_box.addStretch(1)
+        layout.addLayout(res_box, r, 0, 1, 6); r += 1
 
         file_box = QtWidgets.QGridLayout()
         file_box.addWidget(QtWidgets.QLabel("Left file"), 0, 0); file_box.addWidget(self.left_file, 0, 1); file_box.addWidget(self.left_browse, 0, 2)
@@ -218,7 +227,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_browse.clicked.connect(self._browse_left)
         self.right_browse.clicked.connect(self._browse_right)
         self.save_browse.clicked.connect(self._browse_save)
-        self.jpeg_quality.valueChanged.connect(lambda v: self.jpeg_label.setText(f"JPEG Quality: {v}    (size fixed: 480x640)"))
+        self.jpeg_quality.valueChanged.connect(lambda v: self.jpeg_label.setText(f"JPEG Quality: {v}"))
         self.output_mode.currentIndexChanged.connect(self._toggle_depth_controls)
         self.use_realsense.toggled.connect(self._toggle_depth_controls)
         self.start_btn.clicked.connect(self._start)
@@ -226,6 +235,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker: Optional[ClientWorker] = None
         self._update_source_rows()
+        self._toggle_depth_controls()
 
     def _update_source_rows(self):
         is_files = (self.src_mode.currentText() == "Video Files")
@@ -233,6 +243,14 @@ class MainWindow(QtWidgets.QMainWindow):
             w.setEnabled(not is_files if hasattr(bool, "__invert__") else (not is_files))
         for w in [self.left_file, self.left_browse, self.right_file, self.right_browse]:
             w.setEnabled(is_files)
+            self.res_preset.setEnabled(not is_files)
+
+    def _toggle_depth_controls(self):
+        is_depth = (self.output_mode.currentText() == "Depth")
+        self.depth_group.setEnabled(is_depth)
+        rs = self.use_realsense.isChecked()
+        self.focal_px_edit.setEnabled(is_depth and not rs)
+        self.baseline_m_edit.setEnabled(is_depth and not rs)
 
     def _show_cameras(self):
         cams = list_cameras()
@@ -275,13 +293,6 @@ class MainWindow(QtWidgets.QMainWindow):
         d = QtWidgets.QFileDialog.getOpenFileName(self, "Select Output Directory")
         if d: self.save_dir.setText(d)
 
-    def _toggle_depth_controls(self):
-        is_depth = (self.output_mode.currentText() == "Depth")
-        self.depth_group.setEnabled(is_depth)
-        rs = self.use_realsense.isChecked()
-        self.focal_px_edit.setEnabled(is_depth and not rs)
-        self.baseline_m_edit.setEnabled(is_depth and not rs)
-
     def _start(self):
         self.depth_fx, self.depth_baseline_m = None, None
         if self.output_mode.currentText() == "Depth":
@@ -313,6 +324,14 @@ class MainWindow(QtWidgets.QMainWindow):
         path = self.path.text().strip() or "/foundation-stereo"
         fps = float(self.fps.value())
         jpeg_quality = int(self.jpeg_quality.value())
+        try:
+            w_str, h_str = self.res_preset.currentText().split("x")
+            frame_w = int(w_str.strip())
+            frame_h = int(h_str.strip())
+        except Exception:
+            self._log("Invalid resolution; defaulting to 640 x 480")
+            frame_w, frame_h = 640, 480
+
         save_dir = pathlib.Path(self.save_dir.text()) if self.save_dir.text().strip() else None
         session_id = f"gui-{int(time.time())}"
         preview = self.preview.isChecked()
@@ -331,6 +350,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         client = StereoSenderClient(
             host, port, path, fps, jpeg_quality, session_id,
+            frame_width = frame_w, frame_height = frame_h,
             save_dir = save_dir, preview = preview,
             on_log = self._log,
             on_result = self._on_result_image,
@@ -338,7 +358,7 @@ class MainWindow(QtWidgets.QMainWindow):
             on_finish = lambda: self._set_running(False)
         )
         self.worker = ClientWorker(client, left_src, right_src, mode)
-        self.worker.log_signal.conect(self._log)
+        self.worker.log_signal.connect(self._log)
         self.worker.result_signal.connect(self._on_result_image)
         self.worker.start_signal.connect(lambda: self._set_running(True))
         self.worker.finish_signal.connect(lambda: self._set_running(False))
@@ -357,25 +377,57 @@ class MainWindow(QtWidgets.QMainWindow):
     def _log(self, msg: str):
         self.log_box.appendPlainText(msg)
 
+    def _visualize_disparity(self, disp_img: np.ndarray) -> np.ndarray:
+        if disp_img.dtype == np.uint16:
+            d = disp_img.astype(np.float32)
+            hi = np.percentile(d[d > 0], 99.5) if np.any(d > 0) else 1.0
+            vis = np.clip(d / (hi if hi > 0 else 1.0) * 255.0, 0, 255).astype(np.uint8)
+        else:
+            vis = disp_img if disp_img.dtype == np.uint8 else cv2.convertScaleAbs(disp_img)
+        vis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
+        return vis
 
+    def _depth_from_disparity(self, disp_img: np.ndarray, fx: float, baseline_m: float) -> np.ndarray:
+        d = disp_img.astype(np.float32)
+        eps = 1e-6
+        depth = (fx * baseline_m) / np.maximum(d, eps)
+        return depth
 
-    def _on_result_image(self, seq: int, kind: str, enc: str, w: int, h: int, payload: bytes):
+    def _visualize_depth(self, depth_m: np.ndarray) -> np.ndarray:
+        dm = depth_m.copy()
+        dm = np.clip(dm, 0.0, 5.0)
+        inv = (1.0 - (dm / 5.0)) * 255.0
+        vis = inv.astype(np.uint8)
+        vis = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+        return vis
+
+    def _on_result_image(self, seq: int, kind: str, enc: str, w: int, h: int, payload: bytes, meta: dict):
         arr = np.frombuffer(payload, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
         if img is None:
             return
-        if img.dtype == np.uint16:
-            nz = img[img > 0]
-            m = nz.mean() if nz.size else 1.0
-            vis = np.clip((img.astype(np.float32) / (3.0*m)) * 255.0, 0, 255).astype(np.uint8)
-            vis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
+
+        want_depth = (self.output_mode.currentText() == "Depth")
+        if kind == "disparity":
+            if want_depth and self.depth_fx and self.depth_baseline_m:
+                depth_m = self._depth_from_disparity(img, self.depth_fx, self.depth_baseline_m)
+                vis = self._visualize_depth(depth_m)
+            else:
+                vis = self._visualize_disparity(img)
         else:
-            vis = img
-            if vis.ndim == 2:
-                vis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
-        vis = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-        hq, wq = vis.shape[:2]
-        qimg = QtGui.QImage(vis.data, wq, hq, vis.strides[0], QtGui.QImage.Format.Format_RGB888)
+            if img.dtype == np.uint16:
+                nz = img[img > 0]
+                m = nz.mean() if nz.size else 1.0
+                disp = np.clip((img.astype(np.float32) / (3.0 * m)) * 255.0, 0, 255).astype(np.uint8)
+                vis = cv2.applyColorMap(disp, cv2.COLORMAP_INFERNO)
+            else:
+                vis = img
+                if vis.ndim == 2:
+                    cis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
+
+        vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        hq, wq = vis_rgb.shape[:2]
+        qimg = QtGui.QImage(vis_rgb.data, wq, hq, vis_rgb.strides[0], QtGui.QImage.Format.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
         self.preview_label.setPixmap(pix)
 
