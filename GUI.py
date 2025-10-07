@@ -143,12 +143,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_cams_btn = QtWidgets.QPushButton("Show Cameras")
 
         self.res_preset = QtWidgets.QComboBox()
-        self.res_preset.addItems(["320 x 240", "426 x 240", "480 x 360", "640 x 360", "640 x 480", "848 x 480", "960 x 720", "1280 x 720"])
+        self.res_preset.addItems(["640 x 360", "640 x 480", "848 x 480", "960 x 720", "1280 x 720"])
 
         self.left_file = QtWidgets.QLineEdit(); self.left_browse = QtWidgets.QPushButton("Browse...")
         self.right_file = QtWidgets.QLineEdit(); self.right_browse = QtWidgets.QPushButton("Browse...")
 
-        self.fps = QtWidgets.QDoubleSpinBox(); self.fps.setRange(0, 240); self.fps.setValue(10); self.fps.setSingleStep(1)
+        self.fps = QtWidgets.QDoubleSpinBox(); self.fps.setRange(15, 240); self.fps.setValue(15); self.fps.setSingleStep(1)
         self.jpeg_quality = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); self.jpeg_quality.setRange(50, 100); self.jpeg_quality.setValue(90)
         self.jpeg_label = QtWidgets.QLabel("JPEG Quality: 90")
 

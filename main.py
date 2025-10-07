@@ -37,11 +37,11 @@ def main_cli(args):
 
     session_id = args.session_id or f"sess-{int(time.time())}"
     save_dir = pathlib.Path(args.save_dir) if args.save_dir else None
-
+    frame_w, frame_h = parse_res_label(args.resolution)
     client = StereoSenderClient(
         args.host, args.port, args.path,
         args.fps, args.jpeg_quality, session_id,
-        frame_width=args.frame_width, frame_height=args.frame_h,
+        frame_width=frame_w, frame_height=frame_h,
         save_dir=save_dir, preview=args.preview,
         on_log=lambda s: print(s),
         on_result=lambda *a: print(f"[result] seq={a[0]} kind={a[1]} enc={a[2]} {a[3]}x{a[4]} bytes={len(a[5])}"),

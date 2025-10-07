@@ -60,11 +60,49 @@ def read_next_pair_from_files(capL: cv2.VideoCapture, capR: cv2.VideoCapture, sk
 
     return None
 
+_BACKEND_LABELS: Dict[int, str] = {}
+if hasattr(cv2, "CAP_DSHOW"):
+    _BACKEND_LABELS[cv2.CAP_DSHOW] = "CAP_DSHOW"
+if hasattr(cv2, "CAP_MSMF"):
+    _BACKEND_LABELS[cv2.CAP_MSMF] = "CAP_MSMF"
+if hasattr(cv2, "CAP_ANY"):
+    _BACKEND_LABELS[cv2.CAP_ANY] = "CAP_ANY"
+
+def _backend_name(backend: int | None) -> str:
+    if backend is None:
+        return "default"
+    return _BACKEND_LABELS.get(backend, str(backend))
+
 def open_cam(idx: int, height: int, width: int, target_fps: float | None, on_log=None) -> cv2.VideoCapture | None:
-    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(idx)
-    if not cap.isOpened():
+    backend_candidates: list[tuple[int | None, Callable[[int], cv2.VideoCapture]]] = []
+    if os.name == "nt":
+        dshow = getattr(cv2, "CAP_DSHOW", None)
+        if isinstance(dshow, int):
+            backend_candidates.append((dshow, lambda i, b=dshow:cv2.VideoCapture(i, b)))
+        msmf = getattr(cv2, "CAP_MSMF", None)
+        if isinstance(dshow, int):
+            backend_candidates.append((msmf, lambda i, b=msmf: cv2.VideoCapture(i, b)))
+    backend_candidates.append((None, lambda i: cv2.VideoCapture(i)))
+
+    cap = None
+    used_backend: int | None = None
+    for backend, factory in backend_candidates:
+        try:
+            cap = factory(idx)
+        except Exception:
+            cap = None
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            logprint(on_log, f"[camera] backend {_backend_name(backend)} failed to open index {idx}")
+            cap = None
+            continue
+        used_backend = backend
+        break
+    if cap is None:
         logprint(on_log, f"[camera] failed to open index {idx}")
         return None
+    logprint(on_log, f"[camera {idx}] opened using {_backend_name(used_backend)}")
     with contextlib.suppress(Exception):
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"MJPG"))
     if target_fps:
