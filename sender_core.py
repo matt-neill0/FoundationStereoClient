@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Callable, Dict, Any
 import cv2
 import numpy as np
 import websockets
+from websockets.legacy.client import WebSocketClientProtocol
 
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
@@ -20,8 +21,13 @@ def encode_jpeg(img: np.ndarray, quality: int = 90) -> bytes:
         raise RuntimeError("cv2.imencode failed")
     return buf.tobytes()
 
-def read_next_pair_from_caps(capL: cv2.VideoCapture, capR: cv2.VideoCapture, retries: int = 2, backoff_s: float = 0.005) -> tuple | None:
-    def _read_with_retry(cap: cv2.VideoCapture) -> tuple[bool, any]:
+def read_next_pair_from_caps(
+        capL: cv2.VideoCapture,
+        capR: cv2.VideoCapture,
+        retries: int = 2,
+        backoff_s: float = 0.005
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def _read_with_retry(cap: cv2.VideoCapture) -> tuple[bool, Optional[np.ndarray]]:
         ok, frame = cap.read()
         tries = 0
         while (not ok or frame is None) and tries < retries:
@@ -40,7 +46,11 @@ def read_next_pair_from_caps(capL: cv2.VideoCapture, capR: cv2.VideoCapture, ret
 
     return frameL, frameR
 
-def read_next_pair_from_files(capL: cv2.VideoCapture, capR: cv2.VideoCapture, skip_once: bool = True):
+def read_next_pair_from_files(
+        capL: cv2.VideoCapture,
+        capR: cv2.VideoCapture,
+        skip_once: bool = True
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     okL, frameL = capL.read()
     okR, frameR = capR.read()
 
@@ -78,9 +88,9 @@ def open_cam(idx: int, height: int, width: int, target_fps: float | None, on_log
     if os.name == "nt":
         dshow = getattr(cv2, "CAP_DSHOW", None)
         if isinstance(dshow, int):
-            backend_candidates.append((dshow, lambda i, b=dshow:cv2.VideoCapture(i, b)))
+            backend_candidates.append((dshow, lambda i, b=dshow: cv2.VideoCapture(i, b)))
         msmf = getattr(cv2, "CAP_MSMF", None)
-        if isinstance(dshow, int):
+        if isinstance(msmf, int):
             backend_candidates.append((msmf, lambda i, b=msmf: cv2.VideoCapture(i, b)))
     backend_candidates.append((None, lambda i: cv2.VideoCapture(i)))
 
@@ -150,8 +160,8 @@ class StereoSenderClient:
         self._on_finish = on_finish or (lambda: None)
 
         self._stop_flag = asyncio.Event()
-        self._ws = None
-        self._recv_task=None
+        self._ws: Optional[WebSocketClientProtocol] = None
+        self._recv_task: Optional[asyncio.Task] = None
 
     def log(self, msg: str):
         self._on_log(msg)
@@ -192,7 +202,7 @@ class StereoSenderClient:
         ack = await self._ws.recv()
         j = json.loads(ack)
         if not (j.get("type") == "hello_ack" and j.get("ok") is True):
-            raise RuntimeError("fServer did not ack hello: {ack}")
+            raise RuntimeError(f"Server did not ack hello: {ack}")
 
     async def start_stream(self, left_src: str, right_src: str, mode: str):
         if mode == "stream":
@@ -208,6 +218,7 @@ class StereoSenderClient:
 
         uri = f"ws://{self.host}:{self.port}{self.path}"
         self.log(f"Connecting to {uri} ...")
+        self.stop_flag.clear()
 
         async with websockets.connect(uri, max_size=None, ping_interval=20, ping_timeout=20) as ws:
             self._ws = ws
@@ -271,8 +282,8 @@ class StereoSenderClient:
                     with contextlib.suppress(Exception):
                         await self._recv_task
                 with contextlib.suppress(Exception):
-                    if mode == "stream":
                         capL.release(); capR.release()
+                self._ws = None
                 self._on_finish()
 
     def stop(self):

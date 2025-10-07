@@ -1,5 +1,5 @@
 from typing import Optional, List, Tuple
-import os, time, pathlib, subprocess, platform, re, math, contextlib
+import os, time, pathlib, subprocess, platform, re, contextlib
 import numpy as np, cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 from sender_core import StereoSenderClient
@@ -41,7 +41,7 @@ def _linux_list_cameras_v4l2() -> List[Tuple[int, str]]:
     mapping = sorted(set(mapping), key = lambda x: x[0])
     return mapping
 
-def _probs_indices_fallback(max_idx: int = 10) -> List[Tuple[int,str]]:
+def _probe_indices_fallback(max_idx: int = 10) -> List[Tuple[int, str]]:
     out = []
     is_linux = (platform.system().lower() == "linux")
     for idx in range(max_idx):
@@ -61,9 +61,9 @@ def list_cameras() -> List[Tuple[int, str]]:
         cams = _linux_list_cameras_v4l2()
         if cams:
             return cams
-    return _probs_indices_fallback(10)
+    return _probe_indices_fallback(10)
 
-def try_get_realsense_fx_baseline() -> Optional [Tuple[float, float]]:
+def try_get_realsense_fx_baseline() -> Optional[Tuple[float, float]]:
     try:
         import pyrealsense2 as rs
     except Exception:
@@ -87,8 +87,7 @@ def try_get_realsense_fx_baseline() -> Optional [Tuple[float, float]]:
                 fx = float(intr.fx)
 
                 extr = sp_left.get_extrinsics_to(sp_right)
-                baseline_m = float(abs(extr.transnlation[0]))
-                pipe.stop()
+                baseline_m = float(abs(extr.translation[0]))
                 if fx > 0 and baseline_m > 0:
                     return fx, baseline_m
             finally:
@@ -120,7 +119,7 @@ class ClientWorker(QtCore.QThread):
         with contextlib.suppress(Exception):
             asyncio.run(self.client.start_stream(self.left_src, self.right_src, self.mode))
 
-    def stop (self):
+    def stop(self):
         self.client.stop()
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -240,10 +239,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_source_rows(self):
         is_files = (self.src_mode.currentText() == "Video Files")
         for w in [self.left_cam, self.right_cam]:
-            w.setEnabled(not is_files if hasattr(bool, "__invert__") else (not is_files))
+            w.setEnabled(not is_files)
         for w in [self.left_file, self.left_browse, self.right_file, self.right_browse]:
             w.setEnabled(is_files)
-            self.res_preset.setEnabled(not is_files)
+        self.res_preset.setEnabled(not is_files)
 
     def _toggle_depth_controls(self):
         is_depth = (self.output_mode.currentText() == "Depth")
@@ -290,7 +289,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if fn: self.right_file.setText(fn)
 
     def _browse_save(self):
-        d = QtWidgets.QFileDialog.getOpenFileName(self, "Select Output Directory")
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if d: self.save_dir.setText(d)
 
     def _start(self):
@@ -408,6 +407,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         want_depth = (self.output_mode.currentText() == "Depth")
+        vis: np.ndarray
         if kind == "disparity":
             if want_depth and self.depth_fx and self.depth_baseline_m:
                 depth_m = self._depth_from_disparity(img, self.depth_fx, self.depth_baseline_m)
@@ -423,9 +423,12 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 vis = img
                 if vis.ndim == 2:
-                    cis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
+                    vis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
 
-        vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        if vis.ndim == 2:
+            vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)
+        else:
+            vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
         hq, wq = vis_rgb.shape[:2]
         qimg = QtGui.QImage(vis_rgb.data, wq, hq, vis_rgb.strides[0], QtGui.QImage.Format.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
