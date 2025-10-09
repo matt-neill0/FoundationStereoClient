@@ -150,7 +150,7 @@ async def handle_ws(ws):
             continue
         try:
             disp = await loop.run_in_executor(None, backend.infer, left, right)
-            png16 = await loop.run_in_executor(None, disparity_to_png16, disp, MAX_DISP, SCALE=16U)
+            png16 = await loop.run_in_executor(None, disparity_to_png16, disp, MAX_DISP, SCALE_16U)
         except Exception:
             log.exception("Inference failed for seq=%s", seq)
             continue           

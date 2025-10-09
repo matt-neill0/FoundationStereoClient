@@ -3,6 +3,7 @@ import os, time, pathlib, subprocess, platform, re, contextlib
 import numpy as np, cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 from sender_core import StereoSenderClient
+from local_inference import LocalEngineRunner, TensorRTUnavailableError, ensure_tensorrt_runtime
 
 def shutil_which(cmd: str) -> bool:
     from shutil import which
@@ -121,6 +122,68 @@ class ClientWorker(QtCore.QThread):
 
     def stop(self):
         self.client.stop()
+
+class LocalEngineWorker(QtCore.QThread):
+    log_signal = QtCore.Signal(str)
+    result_signal = QtCore.Signal(int, str, str, int, int, bytes, dict)
+    start_signal = QtCore.Signal()
+    finish_signal = QtCore.Signal()
+
+    def __init__(
+        self,
+        engine_path: str,
+        left_src: str,
+        right_src: str,
+        mode: str,
+        frame_width: int,
+        frame_height: int,
+        fps: float,
+        session_id: str,
+        save_dir: Optional[pathlib.Path],
+        preview: bool
+    ):
+        super().__init__()
+        self._start_emitted = False
+        self._finish_emitted = False
+
+        def _start_wrapper():
+            if not self._start_emitted:
+                self._start_emitted = True
+                self.start_signal.emit()
+
+        def _finish_wrapper():
+            if not self._finish_emitted:
+                self._finish_emitted = True
+                self.finish_signal.emit()
+
+        self.runner = LocalEngineRunner(
+            engine_path=engine_path,
+            left_src=left_src,
+            right_src=right_src,
+            mode=mode,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            fps=fps,
+            session_id=session_id,
+            save_dir=save_dir,
+            preview=preview,
+            on_log=lambda s: self.log_signal.emit(s),
+            on_result=lambda *a: self.result_signal.emit(*a),
+            on_start=_start_wrapper,
+            on_finish=_finish_wrapper,
+        )
+
+        def run(self):
+            try:
+                self.runner.run()
+            except Exception as exc:
+                self.log_signal.emit(f"[local] Error: {exc}")
+                if not self._finish_emitted:
+                    self.finish_signal.emit()
+
+        def stop(self):
+            self.runner.stop()
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -323,17 +386,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if d: self.save_dir.setText(d)
 
     def _start(self):
-        if not self.send_to_server.isChecked():
-            engine_path = self.engine_file.text().strip()
+        send_to_server = self.send_to_server.isChecked()
+        engine_path = self.engine_file.text().strip()
+        if not send_to_server:
             if not engine_path:
-                QtWidgets.QMessageBox.warning(self, "TensorRT Engine", "Please select a TensorRT engine before running locally.")
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "TensorRT Engine",
+                    "Please select a TensorRT engine before running locally.",
+                )
                 return
             if not os.path.exists(engine_path):
-                QtWidgets.QMessageBox.warning(self, "TensorRT Engine", "Selected TensorRT engine file does not exist.")
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "TensorRT Engine",
+                    "Selected TensorRT engine file does not exist.",
+                )
+                return
+            try:
+                ensure_tensorrt_runtime()
+            except TensorRTUnavailableError as exc:
+                QtWidgets.QMessageBox.critical(self, "TensorRT", str(exc))
                 return
             self._log(f"[local] Selected TensorRT engine: {engine_path}")
-            QtWidgets.QMessageBox.information(self, "TensorRT Engine", f"Ready to run locally with engine:\n {engine_path}")
-            return
         self.depth_fx, self.depth_baseline_m = None, None
         if self.output_mode.currentText() == "Depth":
             if self.use_realsense.isChecked():
@@ -359,9 +434,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.depth_fx, self.depth_baseline_m = fx, bl
                     self._log(f"[depth] Using manual params: fx={fx:.2f}, baseline={bl:.6f} m")
 
-        host = self.host.text().strip()
-        port = self.port.value()
-        path = self.path.text().strip() or "/foundation-stereo"
         fps = float(self.fps.value())
         jpeg_quality = int(self.jpeg_quality.value())
         try:
@@ -388,16 +460,40 @@ class MainWindow(QtWidgets.QMainWindow):
             right_src = str(self.right_cam.value())
             mode = "stream"
 
-        client = StereoSenderClient(
-            host, port, path, fps, jpeg_quality, session_id,
-            frame_width = frame_w, frame_height = frame_h,
-            save_dir = save_dir, preview = preview,
-            on_log = self._log,
-            on_result = self._on_result_image,
-            on_start = lambda: self._set_running(True),
-            on_finish = lambda: self._set_running(False)
-        )
-        self.worker = ClientWorker(client, left_src, right_src, mode)
+        if send_to_server:
+            host = self.host.text().strip()
+            port = self.port.value()
+            path = self.path.text().strip() or "/foundation-stereo"
+            client = StereoSenderClient(
+                host,
+                port,
+                path,
+                fps,
+                jpeg_quality,
+                session_id,
+                frame_width=frame_w,
+                frame_height=frame_h,
+                save_dir=save_dir,
+                preview=preview,
+                on_log=self._log,
+                on_result=self._on_result_image,
+                on_start=lambda: self._set_running(True),
+                on_finish=lambda: self._set_running(False),
+            )
+            self.worker = ClientWorker(client, left_src, right_src, mode)
+        else:
+            self.worker = LocalEngineWorker(
+                engine_path=engine_path,
+                left_src=left_src,
+                right_src=right_src,
+                mode=mode,
+                frame_width=frame_w,
+                frame_height=frame_h,
+                fps=fps,
+                session_id=session_id,
+                save_dir=save_dir,
+                preview=preview,
+            )
         self.worker.log_signal.connect(self._log)
         self.worker.result_signal.connect(self._on_result_image)
         self.worker.start_signal.connect(lambda: self._set_running(True))
