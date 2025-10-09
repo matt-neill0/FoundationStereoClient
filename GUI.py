@@ -173,16 +173,16 @@ class LocalEngineWorker(QtCore.QThread):
             on_finish=_finish_wrapper,
         )
 
-        def run(self):
-            try:
-                self.runner.run()
-            except Exception as exc:
-                self.log_signal.emit(f"[local] Error: {exc}")
-                if not self._finish_emitted:
-                    self.finish_signal.emit()
+    def run(self):
+        try:
+            self.runner.run()
+        except Exception as exc:
+            self.log_signal.emit(f"[local] Error: {exc}")
+            if not self._finish_emitted:
+                self.finish_signal.emit()
 
-        def stop(self):
-            self.runner.stop()
+    def stop(self):
+        self.runner.stop()
 
 
 class MainWindow(QtWidgets.QMainWindow):

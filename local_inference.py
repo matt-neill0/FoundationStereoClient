@@ -101,11 +101,22 @@ class TensorRTEngine:
         self.context = engine.create_execution_context()
         if self.context is None:
             raise RuntimeError("Failed to create TensorRT execution context")
+        self.stream = cuda.Stream()
 
         if engine.num_optimization_profiles > 0:
-            self.context.active_optimization_profile = 0
+            if hasattr(self.context, "set_optimization_profile_async"):
+                ok = self.context.set_optimization_profile_async(0, self.stream.handle)
+                if not ok:
+                    raise RuntimeError("Failed to set TensorRT optimization profile 0")
+            else:
+                prop = getattr(type(self.context), "active_optimization_profile", None)
+                if isinstance(prop, property) and prop.fset is not None:
+                    self.context.active_optimization_profile = 0
+                else:
+                    raise RuntimeError(
+                        "TensorRT context does not support selecting optimization profile"
+                    )
 
-        self.stream = cuda.Stream()
         self._bindings: List[_Binding] = []
         for idx in range(engine.num_bindings):
             name = engine.get_binding_name(idx)
