@@ -56,7 +56,7 @@ class ORTDynamicBackend:
             log.info("Using CUDAExecutionProvider")
         else:
             providers = ["CPUExecutionProvider"]
-            log.warning("CUDAExecutionProvider not available; using CPUExectionProvider")
+            log.warning("CUDAExecutionProvider not available; using CPUExecutionProvider")
 
         self.sess = ort.InferenceSession(onnx_path, providers=providers)
         self.model = onnx.load(onnx_path)
@@ -143,9 +143,17 @@ async def handle_ws(ws):
             continue
 
         loop = asyncio.get_event_loop()
-        left, right, (mh, mw), (sh, sw) = await loop.run_in_executor(None, backend.prepare_pair, jpegL, jpegR, (0, 0))
-        disp = await loop.run_in_executor(None, backend.infer, left, right)
-        png16 = await loop.run_in_executor(None, disparity_to_png16, disp, MAX_DISP, SCALE_16U)
+        try:
+            left, right, (mh, mw), (sh, sw) = await loop.run_in_executor(None, backend.prepare_pair, jpegL, jpegR)
+        except Exception:
+            log.exception("Failed to prepare frames for seq=%s", seq)
+            continue
+        try:
+            disp = await loop.run_in_executor(None, backend.infer, left, right)
+            png16 = await loop.run_in_executor(None, disparity_to_png16, disp, MAX_DISP, SCALE=16U)
+        except Exception:
+            log.exception("Inference failed for seq=%s", seq)
+            continue           
 
         head_out = {
             "type": "result",
