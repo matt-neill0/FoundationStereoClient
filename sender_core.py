@@ -218,7 +218,7 @@ class StereoSenderClient:
 
         uri = f"ws://{self.host}:{self.port}{self.path}"
         self.log(f"Connecting to {uri} ...")
-        self.stop_flag.clear()
+        self._stop_flag.clear()
 
         async with websockets.connect(uri, max_size=None, ping_interval=20, ping_timeout=20) as ws:
             self._ws = ws

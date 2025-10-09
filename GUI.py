@@ -135,6 +135,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.host = QtWidgets.QLineEdit("jetson.local")
         self.port = QtWidgets.QSpinBox(); self.port.setMaximum(83353); self.port.setValue(8765)
         self.path = QtWidgets.QLineEdit("/foundation-stereo")
+        self.send_to_server = QtWidgets.QCheckBox("Send to server")
+        self.send_to_server.setChecked(False)
+        self.engine_file = QtWidgets.QLineEdit()
+        self.engine_file.setPlaceholderText("TensorRT engine path")
+        self.engine_browse = QtWidgets.QPushButton("Browse TensorRT Engine...")
 
         self.src_mode = QtWidgets.QComboBox(); self.src_mode.addItems(["Live Cameras", "Video Files"])
         self.left_cam = QtWidgets.QSpinBox(); self.left_cam.setRange(0, 9); self.left_cam.setValue(0)
@@ -183,6 +188,11 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("Port"), r, 2); layout.addWidget(self.port, r, 3)
         layout.addWidget(QtWidgets.QLabel("Path"), r, 4); layout.addWidget(self.path, r, 5); r += 1
 
+        layout.addWidget(self.send_to_server, r, 0, 1, 2)
+        layout.addWidget(QtWidgets.QLabel("TensorRT Engine"), r, 2)
+        layout.addWidget(self.engine_file, r, 3, 1, 2)
+        layout.addWidget(self.engine_browse, r, 5); r += 1
+
         layout.addWidget(QtWidgets.QLabel("Source"), r, 0); layout.addWidget(self.src_mode, r, 1, 1, 2); r += 1
 
         cam_box = QtWidgets.QHBoxLayout()
@@ -221,6 +231,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.preview_label, r, 0, 1, 6); r += 1
         layout.addWidget(self.log_box, r, 0, 1, 6); r += 1
 
+        self.send_to_server.toggled.connect(self._toggle_server_destination)
+        self.engine_browse.clicked.connect(self._browse_engine)
         self.src_mode.currentIndexChanged.connect(self._update_source_rows)
         self.show_cams_btn.clicked.connect(self._show_cameras)
         self.left_browse.clicked.connect(self._browse_left)
@@ -234,7 +246,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker: Optional[ClientWorker] = None
         self._update_source_rows()
+        self._toggle_server_destination()
         self._toggle_depth_controls()
+
+    def _toggle_server_destination(self):
+        send = self.send_to_server.isChecked()
+        for w in [self.host, self.port, self.path]:
+            w.setEnabled(send)
+        self.engine_file.setEnabled(not send)
+        self.engine_browse.setEnabled(not send)
+
+    def _browse_engine(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select TensorRT Engine",
+            "",
+            "TensorRT Engines (*.engine);;All Files (*)"
+        )
+        if fn:
+            self.engine_file.setText(fn)
 
     def _update_source_rows(self):
         is_files = (self.src_mode.currentText() == "Video Files")
@@ -293,6 +323,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if d: self.save_dir.setText(d)
 
     def _start(self):
+        if not self.send_to_server.isChecked():
+            engine_path = self.engine_file.text().strip()
+            if not engine_path:
+                QtWidgets.QMessageBox.warning(self, "TensorRT Engine", "Please select a TensorRT engine before running locally.")
+                return
+            if not os.path.exists(engine_path):
+                QtWidgets.QMessageBox.warning(self, "TensorRT Engine", "Selected TensorRT engine file does not exist.")
+                return
+            self._log(f"[local] Selected TensorRT engine: {engine_path}")
+            QtWidgets.QMessageBox.information(self, "TensorRT Engine", f"Ready to run locally with engine:\n {engine_path}")
+            return
         self.depth_fx, self.depth_baseline_m = None, None
         if self.output_mode.currentText() == "Depth":
             if self.use_realsense.isChecked():
