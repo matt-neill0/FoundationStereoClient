@@ -16,9 +16,10 @@ class TensorRTUnavailableError(RuntimeError):
 
 _TRT_MODULE = None
 _CUDA_MODULE = None
+_CUDA_AUTOINIT = None
 
 def ensure_tensorrt_runtime():
-    global _TRT_MODULE, _CUDA_MODULE
+    global _TRT_MODULE, _CUDA_MODULE, _CUDA_AUTOINIT
 
     if _TRT_MODULE is not None and _CUDA_MODULE is not None:
         return _TRT_MODULE, _CUDA_MODULE
@@ -40,8 +41,29 @@ def ensure_tensorrt_runtime():
             "running local inference."
         ) from Exception
 
-    _TRT_MODULE, _CUDA_MODULE = trt, cuda
+    _TRT_MODULE, _CUDA_MODULE, _CUDA_AUTOINIT = trt, cuda, pycuda.autoinit
     return trt, cuda
+
+@contextlib.contextmanager
+def push_cuda_context():
+    ensure_tensorrt_runtime()
+    ctx = getattr(_CUDA_AUTOINIT, "context", None)
+    if ctx is None:
+        yield None
+        return
+
+    push = getattr(ctx, "push", None)
+    pop = getattr(ctx, "pop", None)
+    if push is None or pop is None:
+        yield ctx
+        return
+
+    push()
+    try:
+        yield ctx
+    finally:
+        pop()
+
 
 def align32(x:int) -> int:
     return (x + 31) // 32 * 32
@@ -101,8 +123,8 @@ class TensorRTEngine:
         self.context = engine.create_execution_context()
         if self.context is None:
             raise RuntimeError("Failed to create TensorRT execution context")
-        self.stream = cuda.Stream()
 
+        self.stream = cuda.Stream()
         if engine.num_optimization_profiles > 0:
             if hasattr(self.context, "set_optimization_profile_async"):
                 ok = self.context.set_optimization_profile_async(0, self.stream.handle)
@@ -117,19 +139,46 @@ class TensorRTEngine:
                         "TensorRT context does not support selecting optimization profile"
                     )
 
+        self._legacy_bindings = hasattr(engine, "num_bindings")
         self._bindings: List[_Binding] = []
-        for idx in range(engine.num_bindings):
-            name = engine.get_binding_name(idx)
-            dtype = np.dtype(trt.nptype(engine.get_binding_dtype(idx)))
-            shape = tuple(engine.get_binding_shape(idx))
-            binding = _Binding(
-                name=name,
-                index=idx,
-                is_input=engine.binding_is_input(idx),
-                dtype=dtype,
-                shape=shape,
-            )
-            self._bindings.append(binding)
+        if self._legacy_bindings:
+            for idx in range(engine.num_bindings):
+                name = engine.get_binding_name(idx)
+                dtype = np.dtype(trt.nptype(engine.get_binding_dtype(idx)))
+                shape = tuple(engine.get_binding_shape(idx))
+                binding = _Binding(
+                    name=name,
+                    index=idx,
+                    is_input=engine.binding_is_input(idx),
+                    dtype=dtype,
+                    shape=shape,
+                )
+                self._bindings.append(binding)
+        else:
+            if not hasattr(engine, "num_io_tensors"):
+                raise RuntimeError(
+                    "TensorRT engine does not expose binding enumeration APIs"
+                )
+
+            tensor_mode = getattr(trt, "TensorIOMode", None)
+            if tensor_mode is None:
+                raise RuntimeError(
+                    "TensorRT runtime is missing TensorIOMode; cannot classify IO tensors"
+                )
+
+            for idx in range(engine.num_io_tensors):
+                name = engine.get_tensor_name(idx)
+                mode = engine.get_tensor_mode(name)
+                dtype = np.dtype(trt.nptype(engine.get_tensor_dtype(name)))
+                shape = tuple(engine.get_tensor_shape(name))
+                binding = _Binding(
+                    name=name,
+                    index=idx,
+                    is_input=(mode == tensor_mode.INPUT),
+                    dtype=dtype,
+                    shape=shape,
+                )
+                self._bindings.append(binding)
 
     @property
     def inputs(self) -> Iterable[_Binding]:
@@ -140,12 +189,24 @@ class TensorRTEngine:
         return (b for b in self._bindings if not b.is_input)
 
     def _set_input_shape(self, binding: _Binding, shape: Tuple[int, ...]):
-        if binding.is_input:
+        if not binding.is_input:
+            return
+
+        if self._legacy_bindings:
             self.context.set_binding_shape(binding.index, shape)
             binding.shape = tuple(self.context.get_binding_shape(binding.index))
+        else:
+            set_shape = getattr(self.context, "set_input_shape", None)
+            if set_shape is None:
+                raise RuntimeError("TensorRT context lacks set_input_shape for tensor API")
+            set_shape(binding.name, shape)
+            binding.shape = tuple(self.context.get_tensor_shape(binding.name))
 
     def _ensure_allocation(self, binding: _Binding):
-        shape = tuple(self.context.get_binding_shape(binding.index))
+        if self._legacy_bindings:
+            shape = tuple(self.context.get_binding_shape(binding.index))
+        else:
+            shape = tuple(self.context.get_tensor_shape(binding.name))
         size = int(np.prod(shape))
         if size <= 0:
             raise RuntimeError(f"Invalid binding shape for {binding.name!r}: {shape}")
@@ -174,7 +235,10 @@ class TensorRTEngine:
         self._set_input_shape(left_binding, tuple(int(x) for x in left.shape))
         self._set_input_shape(right_binding, tuple(int(x) for x in right.shape))
 
-        out_shape = tuple(self.context.get_binding_shape(out_binding.index))
+        if self._legacy_bindings:
+            out_shape = tuple(self.context.get_binding_shape(out_binding.index))
+        else:
+            out_shape = tuple(self.context.get_tensor_shape(out_binding.name))
 
         self._ensure_allocation(left_binding)
         self._ensure_allocation(right_binding)
@@ -183,15 +247,33 @@ class TensorRTEngine:
         np.copyto(left_binding.host_mem, np.asarray(left, dtype=left_binding.dtype).ravel())
         np.copyto(right_binding.host_mem, np.asarray(right, dtype=right_binding.dtype).ravel())
 
-        bindings: List[int] = [0] * self.engine.num_bindings
-        bindings[left_binding.index] = int(left_binding.device_mem)
-        bindings[right_binding.index] = int(right_binding.device_mem)
-        bindings[out_binding.index] = int(out_binding.device_mem)
+        if self._legacy_bindings:
+            bindings: List[int] = [0] * self.engine.num_bindings
+            bindings[left_binding.index] = int(left_binding.device_mem)
+            bindings[right_binding.index] = int(right_binding.device_mem)
+            bindings[out_binding.index] = int(out_binding.device_mem)
 
-        self.cuda.memcpy_htod_async(left_binding.device_mem, left_binding.host_mem, self.stream)
-        self.cuda.memcpy_htod_async(right_binding.device_mem, right_binding.host_mem, self.stream)
+            self.cuda.memcpy_htod_async(left_binding.device_mem, left_binding.host_mem, self.stream)
+            self.cuda.memcpy_htod_async(right_binding.device_mem, right_binding.host_mem, self.stream)
 
-        self.context.execute_async_v2(bindings=bindings, stream_handle=self.stream.handle)
+            self.context.execute_async_v2(bindings=bindings, stream_handle=self.stream.handle)
+
+        else:
+            set_addr = getattr(self.context, "set_tensor_address", None)
+            enqueue_v3 = getattr(self.context, "enqueue_v3", None)
+            if set_addr is None or enqueue_v3 is None:
+                raise RuntimeError("TensorRT context lacks tensor API execution methods")
+
+            self.cuda.memcpy_htod_async(left_binding.device_mem, left_binding.host_mem, self.stream)
+            self.cuda.memcpy_htod_async(right_binding.device_mem, right_binding.host_mem, self.stream)
+
+            set_addr(left_binding.name, int(left_binding.device_mem))
+            set_addr(right_binding.name, int(right_binding.device_mem))
+            set_addr(out_binding.name, int(out_binding.device_mem))
+
+            ok = enqueue_v3(self.stream.handle)
+            if not ok:
+                raise RuntimeError("TensorRT enqueue_v3 execution failed")
 
         self.cuda.memcpy_dtoh_async(out_binding.host_mem, out_binding.device_mem, self.stream)
         self.stream.synchronize()
@@ -309,93 +391,94 @@ class LocalEngineRunner:
 
     def run(self):
         self._stop_event.clear()
-        self.on_log(f"[local] Loading TensorRT engine: {self.engine_path}")
-        engine = TensorRTEngine(self.engine_path)
-        self.on_log("[local] TensorRT engine ready.")
+        with push_cuda_context():
+            self.on_log(f"[local] Loading TensorRT engine: {self.engine_path}")
+            engine = TensorRTEngine(self.engine_path)
+            self.on_log("[local] TensorRT engine ready.")
 
-        capL = capR = None
-        seq = 0
-        frame_interval = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.0
-        next_t = time.perf_counter()
+            capL = capR = None
+            seq = 0
+            frame_interval = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.0
+            next_t = time.perf_counter()
 
-        try:
-            capL, capR = self._open_sources()
-            self.on_start()
-
-            if self.save_dir:
-                self.save_dir.mkdir(parents=True, exist_ok=True)
-
-            while not self._stop_event.is_set():
-                pair = self._read_pair(capL, capR)
-                if pair is None:
-                    self.on_log("[local] End of source(s).")
-                    break
-
-                frameL, frameR = pair
-
-                if (
-                        self.frame_width > 0
-                        and self.frame_height > 0
-                        and (frameL.shape[1] != self.frame_width or frameL.shape[0] != self.frame_height)
-                ):
-                    frameL = cv2.resize(
-                        frameL, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA
-                    )
-                if (
-                        self.frame_width > 0
-                        and self.frame_height > 0
-                        and (frameR.shape[1] != self.frame_width or frameR.shape[0] != self.frame_height)
-                ):
-                    frameR = cv2.resize(
-                        frameR, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA
-                    )
-
-                try:
-                    left_pre, right_pre, (mh, mw), (sh, sw) = self._prepare_frames(frameL, frameR)
-                except Exception as exc:
-                    self.on_log(f"[local] Failed to prepare frames: {exc}")
-                    raise
-
-                try:
-                    disp = engine.infer(left_pre, right_pre)
-                except Exception as exc:
-                    self.on_log(f"[local] TensorRT inference failed: {exc}")
-                    raise
-
-                try:
-                    png16 = disparity_to_png16(disp, self.max_disp, self.disp_scale)
-                except Exception as exc:
-                    self.on_log(f"[local] Failed to encode disparity: {exc}")
-                    raise
-
-                meta = {
-                    "session_id": self.session_id,
-                    "source_mode": self.mode,
-                    "sender_wh": [int(sw), int(sh)],
-                    "aligned32": bool(self.align_to_32),
-                    "letterbox": bool(self.letterbox),
-                }
-
-                self.on_result(seq, "disparity", "png16", int(mw), int(mh), png16, meta)
+            try:
+                capL, capR = self._open_sources()
+                self.on_start()
 
                 if self.save_dir:
-                    fname = self.save_dir / f"disparity_seq{seq:06d}.png"
-                    with open(fname, "wb") as f:
-                        f.write(png16)
+                    self.save_dir.mkdir(parents=True, exist_ok=True)
 
-                seq += 1
+                while not self._stop_event.is_set():
+                    pair = self._read_pair(capL, capR)
+                    if pair is None:
+                        self.on_log("[local] End of source(s).")
+                        break
 
-                if frame_interval > 0.0:
-                    next_t += frame_interval
-                    sleep_s = next_t - time.perf_counter()
-                    if sleep_s > 0:
-                        if self._stop_event.wait(timeout=sleep_s):
-                            break
-        finally:
-            with contextlib.suppress(Exception):
-                if capL is not None:
-                    capL.release()
-            with contextlib.suppress(Exception):
-                if capR is not None:
-                    capR.release()
-            self.on_finish()
+                    frameL, frameR = pair
+
+                    if (
+                            self.frame_width > 0
+                            and self.frame_height > 0
+                            and (frameL.shape[1] != self.frame_width or frameL.shape[0] != self.frame_height)
+                    ):
+                        frameL = cv2.resize(
+                            frameL, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA
+                        )
+                    if (
+                            self.frame_width > 0
+                            and self.frame_height > 0
+                            and (frameR.shape[1] != self.frame_width or frameR.shape[0] != self.frame_height)
+                    ):
+                        frameR = cv2.resize(
+                            frameR, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA
+                        )
+
+                    try:
+                        left_pre, right_pre, (mh, mw), (sh, sw) = self._prepare_frames(frameL, frameR)
+                    except Exception as exc:
+                        self.on_log(f"[local] Failed to prepare frames: {exc}")
+                        raise
+
+                    try:
+                        disp = engine.infer(left_pre, right_pre)
+                    except Exception as exc:
+                        self.on_log(f"[local] TensorRT inference failed: {exc}")
+                        raise
+
+                    try:
+                        png16 = disparity_to_png16(disp, self.max_disp, self.disp_scale)
+                    except Exception as exc:
+                        self.on_log(f"[local] Failed to encode disparity: {exc}")
+                        raise
+
+                    meta = {
+                        "session_id": self.session_id,
+                        "source_mode": self.mode,
+                        "sender_wh": [int(sw), int(sh)],
+                        "aligned32": bool(self.align_to_32),
+                        "letterbox": bool(self.letterbox),
+                    }
+
+                    self.on_result(seq, "disparity", "png16", int(mw), int(mh), png16, meta)
+
+                    if self.save_dir:
+                        fname = self.save_dir / f"disparity_seq{seq:06d}.png"
+                        with open(fname, "wb") as f:
+                            f.write(png16)
+
+                    seq += 1
+
+                    if frame_interval > 0.0:
+                        next_t += frame_interval
+                        sleep_s = next_t - time.perf_counter()
+                        if sleep_s > 0:
+                            if self._stop_event.wait(timeout=sleep_s):
+                                break
+            finally:
+                with contextlib.suppress(Exception):
+                    if capL is not None:
+                        capL.release()
+                with contextlib.suppress(Exception):
+                    if capR is not None:
+                        capR.release()
+                self.on_finish()
