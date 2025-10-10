@@ -4,6 +4,7 @@ import numpy as np, cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 from sender_core import StereoSenderClient
 from local_inference import LocalEngineRunner, TensorRTUnavailableError, ensure_tensorrt_runtime
+from main import DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS
 
 def shutil_which(cmd: str) -> bool:
     from shutil import which
@@ -209,15 +210,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right_cam = QtWidgets.QSpinBox(); self.right_cam.setRange(0, 9); self.right_cam.setValue(1)
         self.show_cams_btn = QtWidgets.QPushButton("Show Cameras")
 
-        self.res_preset = QtWidgets.QComboBox()
-        self.res_preset.addItems(["640 x 360", "640 x 480", "848 x 480", "960 x 720", "1280 x 720"])
+        self.resolution_display = QtWidgets.QLabel(f"Resolution: {DEFAULT_WIDTH} x {DEFAULT_HEIGHT}")
+        self.fps_display = QtWidgets.QLabel(f"FPS: {int(DEFAULT_FPS)}")
 
         self.left_file = QtWidgets.QLineEdit(); self.left_browse = QtWidgets.QPushButton("Browse...")
         self.right_file = QtWidgets.QLineEdit(); self.right_browse = QtWidgets.QPushButton("Browse...")
-
-        self.fps = QtWidgets.QDoubleSpinBox(); self.fps.setRange(15, 240); self.fps.setValue(15); self.fps.setSingleStep(1)
-        self.jpeg_quality = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); self.jpeg_quality.setRange(50, 100); self.jpeg_quality.setValue(90)
-        self.jpeg_label = QtWidgets.QLabel("JPEG Quality: 90")
 
         self.output_mode = QtWidgets.QComboBox(); self.output_mode.addItems(["Disparity", "Depth"])
         self.depth_group = QtWidgets.QGroupBox("Depth Options")
@@ -267,8 +264,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(cam_box, r, 0, 1, 6); r += 1
 
         res_box = QtWidgets.QHBoxLayout()
-        res_box.addWidget(QtWidgets.QLabel("Resolution"))
-        res_box.addWidget(self.res_preset)
+        res_box.addWidget(self.resolution_display)
+        res_box.addSpacing(12)
+        res_box.addWidget(self.fps_display)
         res_box.addStretch(1)
         layout.addLayout(res_box, r, 0, 1, 6); r += 1
 
@@ -276,9 +274,6 @@ class MainWindow(QtWidgets.QMainWindow):
         file_box.addWidget(QtWidgets.QLabel("Left file"), 0, 0); file_box.addWidget(self.left_file, 0, 1); file_box.addWidget(self.left_browse, 0, 2)
         file_box.addWidget(QtWidgets.QLabel("Right file"), 1, 0); file_box.addWidget(self.right_file, 1, 1); file_box.addWidget(self.right_browse, 1, 2)
         layout.addLayout(file_box, r, 0, 1, 6); r += 1
-
-        layout.addWidget(QtWidgets.QLabel("FPS"), r, 0); layout.addWidget(self.fps, r, 1)
-        layout.addWidget(self.jpeg_label, r, 2); layout.addWidget(self.jpeg_quality, r, 3, 1, 3); r += 1
 
         layout.addWidget(QtWidgets.QLabel("Output"), r, 0); layout.addWidget(self.output_mode, r, 1); r += 1
         layout.addWidget(self.depth_group, r, 0, 1, 6); r += 1
@@ -301,7 +296,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_browse.clicked.connect(self._browse_left)
         self.right_browse.clicked.connect(self._browse_right)
         self.save_browse.clicked.connect(self._browse_save)
-        self.jpeg_quality.valueChanged.connect(lambda v: self.jpeg_label.setText(f"JPEG Quality: {v}"))
         self.output_mode.currentIndexChanged.connect(self._toggle_depth_controls)
         self.use_realsense.toggled.connect(self._toggle_depth_controls)
         self.start_btn.clicked.connect(self._start)
@@ -335,7 +329,6 @@ class MainWindow(QtWidgets.QMainWindow):
             w.setEnabled(not is_files)
         for w in [self.left_file, self.left_browse, self.right_file, self.right_browse]:
             w.setEnabled(is_files)
-        self.res_preset.setEnabled(not is_files)
 
     def _toggle_depth_controls(self):
         is_depth = (self.output_mode.currentText() == "Depth")
@@ -434,15 +427,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.depth_fx, self.depth_baseline_m = fx, bl
                     self._log(f"[depth] Using manual params: fx={fx:.2f}, baseline={bl:.6f} m")
 
-        fps = float(self.fps.value())
-        jpeg_quality = int(self.jpeg_quality.value())
-        try:
-            w_str, h_str = self.res_preset.currentText().split("x")
-            frame_w = int(w_str.strip())
-            frame_h = int(h_str.strip())
-        except Exception:
-            self._log("Invalid resolution; defaulting to 640 x 480")
-            frame_w, frame_h = 640, 480
+        fps = DEFAULT_FPS
+        frame_w, frame_h = DEFAULT_WIDTH, DEFAULT_HEIGHT
 
         save_dir = pathlib.Path(self.save_dir.text()) if self.save_dir.text().strip() else None
         session_id = f"gui-{int(time.time())}"
@@ -468,9 +454,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 host,
                 port,
                 path,
-                fps,
-                jpeg_quality,
-                session_id,
+                fps = fps,
+                session_id=session_id,
                 frame_width=frame_w,
                 frame_height=frame_h,
                 save_dir=save_dir,

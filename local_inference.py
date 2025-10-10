@@ -5,6 +5,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from main import DEFAULT_FPS
+
 from sender_core import (
     open_cam,
     read_next_pair_from_caps,
@@ -88,7 +90,11 @@ def preprocess_rgb(image_bgr: np.ndarray) -> np.ndarray:
 def disparity_to_png16(disp: np.ndarray, max_disp: float, scale: float) -> bytes:
     d = np.nan_to_num(disp, nan=0.0, posinf=max_disp, neginf=0.0)
     d = np.clip(d, 0.0, max_disp)
-    d16 = np.round(d * scale).astype(np.uint16)
+    scaled = np.round(d * scale)
+    if scaled.dtype != np.float32 and scaled.dtype != np.float64:
+        scaled = scaled.astype(np.float32, copy=False)
+    scaled = np.clip(scaled, 0.0, np.float32(np.iinfo(np.uint16).max))
+    d16 = np.ascontiguousarray(scaled.astype(np.uint16))
     ok, buf = cv2.imencode(".png", d16)
     if not ok:
         raise RuntimeError("cv2.imencode PNG failed")
@@ -260,9 +266,23 @@ class TensorRTEngine:
 
         else:
             set_addr = getattr(self.context, "set_tensor_address", None)
-            enqueue_v3 = getattr(self.context, "enqueue_v3", None)
-            if set_addr is None or enqueue_v3 is None:
-                raise RuntimeError("TensorRT context lacks tensor API execution methods")
+            enqueue = None
+            for name in (
+                    "enqueue_async_v3",
+                    "enqueue_v3",
+                    "enqueueV3",
+                    "execute_async_v3",
+                    "execute_v3",
+                    "executeV3",
+            ):
+                enqueue = getattr(self.context, name, None)
+                if enqueue is not None:
+                    break
+
+            if set_addr is None or enqueue is None:
+                raise RuntimeError(
+                    "TensorRT context lacks tensor API execution methods"
+                )
 
             self.cuda.memcpy_htod_async(left_binding.device_mem, left_binding.host_mem, self.stream)
             self.cuda.memcpy_htod_async(right_binding.device_mem, right_binding.host_mem, self.stream)
@@ -271,9 +291,13 @@ class TensorRTEngine:
             set_addr(right_binding.name, int(right_binding.device_mem))
             set_addr(out_binding.name, int(out_binding.device_mem))
 
-            ok = enqueue_v3(self.stream.handle)
-            if not ok:
-                raise RuntimeError("TensorRT enqueue_v3 execution failed")
+            try:
+                ok = enqueue(self.stream.handle)
+            except TypeError:
+                ok = enqueue()
+
+            if ok is False:
+                raise RuntimeError("TensorRT tensor API execution failed")
 
         self.cuda.memcpy_dtoh_async(out_binding.host_mem, out_binding.device_mem, self.stream)
         self.stream.synchronize()
@@ -294,8 +318,8 @@ class LocalEngineRunner:
             mode: str,
             frame_width: int,
             frame_height: int,
-            fps: float,
             session_id: str,
+            fps: float = DEFAULT_FPS,
             save_dir: Optional[pathlib.Path] = None,
             preview: bool = True,
             align_to_32: bool = True,
@@ -315,7 +339,7 @@ class LocalEngineRunner:
         self.mode = mode
         self.frame_width = int(frame_width)
         self.frame_height = int(frame_height)
-        self.fps = float(fps)
+        self.fps = float(fps) if fps else DEFAULT_FPS
         self.session_id = session_id
         self.save_dir = save_dir
         self.preview = preview

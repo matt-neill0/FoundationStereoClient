@@ -1,11 +1,8 @@
 import argparse, pathlib, time, os, sys, asyncio
-from sender_core import StereoSenderClient
 
-ALLOWED_RESOLUTIONS = ["320 x 240", "426 x 240", "480 x 360", "640 x 360", "640 x 480", "848 x 480", "960 x 720", "1280 x 720"]
-
-def parse_res_label(label: str) -> tuple[int, int]:
-    w_str, h_str = label.split("x")
-    return int(w_str.strip()), int(h_str.strip())
+DEFAULT_HEIGHT = 480
+DEFAULT_WIDTH = 640
+DEFAULT_FPS = 30.0
 
 def build_arg_parser():
     p = argparse.ArgumentParser(description="Stereo sender. Use --gui to launch desktop app.")
@@ -17,9 +14,6 @@ def build_arg_parser():
     p.add_argument("--right-cam", type=int)
     p.add_argument("--left-file")
     p.add_argument("--right-file")
-    p.add_argument("--fps", type=float, default=10.0)
-    p.add_argument("--jpeg-quality", type=int, default=90)
-    p.add_argument("--resolution", choices=ALLOWED_RESOLUTIONS, default="640 x 480", help="Live stream resolution (WxH)")
     p.add_argument("--session-id", default=None)
     p.add_argument("--save-dir", default=None)
     p.add_argument("--preview", action="store_true")
@@ -37,10 +31,10 @@ def main_cli(args):
 
     session_id = args.session_id or f"sess-{int(time.time())}"
     save_dir = pathlib.Path(args.save_dir) if args.save_dir else None
-    frame_w, frame_h = parse_res_label(args.resolution)
+    frame_w, frame_h = DEFAULT_WIDTH, DEFAULT_HEIGHT
     client = StereoSenderClient(
         args.host, args.port, args.path,
-        args.fps, args.jpeg_quality, session_id,
+        session_id=session_id,
         frame_width=frame_w, frame_height=frame_h,
         save_dir=save_dir, preview=args.preview,
         on_log=lambda s: print(s),
@@ -55,6 +49,7 @@ def main_cli(args):
         pass
 
 if __name__ == "__main__":
+    from sender_core import StereoSenderClient
     ap = build_arg_parser()
     args = ap.parse_args()
     if args.gui:

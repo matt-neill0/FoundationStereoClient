@@ -4,9 +4,7 @@ import cv2
 import numpy as np
 import websockets
 from websockets.legacy.client import WebSocketClientProtocol
-
-DEFAULT_WIDTH = 640
-DEFAULT_HEIGHT = 480
+from main import DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS
 
 def logprint(cb, msg: str):
     try:
@@ -15,8 +13,8 @@ def logprint(cb, msg: str):
     except Exception:
         print(msg)
 
-def encode_jpeg(img: np.ndarray, quality: int = 90) -> bytes:
-    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+def encode_jpeg(img: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".jpg", img)
     if not ok:
         raise RuntimeError("cv2.imencode failed")
     return buf.tobytes()
@@ -131,9 +129,8 @@ class StereoSenderClient:
             host: str,
             port: int,
             path: str,
-            fps: float,
-            jpeg_quality: int,
             session_id: str,
+            fps: float = DEFAULT_FPS,
             frame_width: int = DEFAULT_WIDTH,
             frame_height: int = DEFAULT_HEIGHT,
             save_dir: Optional[pathlib.Path] = None,
@@ -146,8 +143,7 @@ class StereoSenderClient:
         self.host = host
         self.port = port
         self.path = path
-        self.fps = fps
-        self.jpeg_quality = jpeg_quality
+        self.fps = float(fps) if fps else DEFAULT_FPS
         self.session_id = session_id
         self.frame_width = int(frame_width)
         self.frame_height = int(frame_height)
@@ -255,8 +251,8 @@ class StereoSenderClient:
                     frameL, frameR = pair
                     frameL = cv2.resize(frameL, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA)
                     frameR = cv2.resize(frameR, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA)
-                    jpegL = encode_jpeg(frameL, self.jpeg_quality)
-                    jpegR = encode_jpeg(frameR, self.jpeg_quality)
+                    jpegL = encode_jpeg(frameL)
+                    jpegR = encode_jpeg(frameR)
 
                     payload = {
                         "type": "frame",

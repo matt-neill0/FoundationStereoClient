@@ -39,7 +39,11 @@ def preprocess_rgb(image_bgr: np.ndarray) -> np.ndarray:
 def disparity_to_png16(disp: np.ndarray, max_disp:float, scale: float) -> bytes:
     d = np.nan_to_num(disp, nan=0.0, posinf=max_disp, neginf=0.0)
     d = np.clip(d, 0.0, max_disp)
-    d16 = np.round(d * scale).astype(np.uint16)
+    scaled = np.round(d * scale)
+    if scaled.dtype != np.float32 and scaled.dtype != np.float64:
+        scaled = scaled.astype(np.float32, copy=False)
+    scaled = np.clip(scaled, 0.0, np.float32(np.iinfo(np.uint16).max))
+    d16 = np.ascontiguousarray(scaled.astype(np.uint16))
     ok, buf = cv2.imencode(".png", d16)
     if not ok:
         raise RuntimeError("cv2.imencode PNG failed")
