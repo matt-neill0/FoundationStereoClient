@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="35f0f9db-be60-443b-8397-3c5b546279fc" name="Changes" comment="Fixed preview&#10;&#10;Streamlined scripts">
+    <list default="true" id="35f0f9db-be60-443b-8397-3c5b546279fc" name="Changes" comment="Fixed depth preview display">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/GUI.py" beforeDir="false" afterPath="$PROJECT_DIR$/GUI.py" afterDir="false" />
     </list>
@@ -168,7 +168,15 @@
       <option name="project" value="LOCAL" />
       <updated>1760179602791</updated>
     </task>
-    <option name="localTasksCounter" value="12" />
+    <task id="LOCAL-00012" summary="Fixed depth preview display">
+      <option name="closed" value="true" />
+      <created>1760180555192</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1760180555192</updated>
+    </task>
+    <option name="localTasksCounter" value="13" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -196,7 +204,8 @@
     <MESSAGE value="improved gui for realsense usage" />
     <MESSAGE value="Removed server sending functionality to make this a local inferer" />
     <MESSAGE value="Fixed preview&#10;&#10;Streamlined scripts" />
-    <option name="LAST_COMMIT_MESSAGE" value="Fixed preview&#10;&#10;Streamlined scripts" />
+    <MESSAGE value="Fixed depth preview display" />
+    <option name="LAST_COMMIT_MESSAGE" value="Fixed depth preview display" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/FoundationStereoClient$main.coverage" NAME="main Coverage Results" MODIFIED="1759640591310" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />

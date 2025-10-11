@@ -37,6 +37,9 @@ class SessionConfig:
     save_dir: Optional[Path]
     preview: bool
     use_realsense: bool
+    pose_enabled: bool = False
+    pose_model: Optional[str] = None
+    pose_augmentation: Optional[str] = None
 
 def shutil_which(cmd: str) -> bool:
     from shutil import which
@@ -248,6 +251,26 @@ class MainWindow(QtWidgets.QMainWindow):
         depth_layout.addWidget(self.focal_px_edit, 0, 1)
         depth_layout.addWidget(QtWidgets.QLabel("Baseline(m)"), 1, 0)
         depth_layout.addWidget(self.baseline_m_edit, 1, 1)
+        self.pose_checkbox = QtWidgets.QCheckBox("Feed depth into pose estimation")
+        self.pose_model_label = QtWidgets.QLabel("Pose model")
+        self.pose_model_combo = QtWidgets.QComboBox();
+        self.pose_model_combo.addItems([
+            "OpenPose",
+            "MoveNet",
+            "BlazePose",
+        ])
+        self.pose_aug_label = QtWidgets.QLabel("Augmentation method")
+        self.pose_aug_combo = QtWidgets.QComboBox();
+        self.pose_aug_combo.addItems([
+            "Pre-processing",
+            "Early-fusion",
+            "Mid/Late fusion",
+        ])
+        depth_layout.addWidget(self.pose_checkbox, 2, 0, 1, 2)
+        depth_layout.addWidget(self.pose_model_label, 3, 0)
+        depth_layout.addWidget(self.pose_model_combo, 3, 1)
+        depth_layout.addWidget(self.pose_aug_label, 4, 0)
+        depth_layout.addWidget(self.pose_aug_combo, 4, 1)
         depth_layout.setColumnStretch(1, 1)
 
         self.use_realsense = QtWidgets.QCheckBox("Use RealSense")
@@ -321,6 +344,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output_mode.currentIndexChanged.connect(self._sync_depth_controls)
         self.use_realsense.toggled.connect(self._toggle_realsense_capture)
         self.use_realsense.toggled.connect(self._sync_depth_controls)
+        self.pose_checkbox.toggled.connect(self._sync_depth_controls)
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
 
@@ -445,6 +469,10 @@ class MainWindow(QtWidgets.QMainWindow):
         left_src, right_src, mode = sources
         session_id = f"gui-{int(time.time())}"
 
+        pose_enabled = (self.output_mode.currentText() == "Depth") and self.pose_checkbox.isChecked()
+        pose_model = self.pose_model_combo.currentText() if pose_enabled else None
+        pose_augmentation = self.pose_aug_combo.currentText() if pose_enabled else None
+
         return SessionConfig(
             engine_path=str(engine_path),
             left_src=left_src,
@@ -457,6 +485,9 @@ class MainWindow(QtWidgets.QMainWindow):
             save_dir=self._selected_save_dir(),
             preview=False,
             use_realsense=use_realsense,
+            pose_enabled=pose_enabled,
+            pose_model=pose_model,
+            pose_augmentation=pose_augmentation
         )
 
     def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
@@ -497,6 +528,16 @@ class MainWindow(QtWidgets.QMainWindow):
         rs = self.use_realsense.isChecked()
         self.focal_px_edit.setEnabled(is_depth and not rs)
         self.baseline_m_edit.setEnabled(is_depth and not rs)
+        if not is_depth and self.pose_checkbox.isChecked():
+            self.pose_checkbox.blockSignals(True)
+            self.pose_checkbox.setChecked(False)
+            self.pose_checkbox.blockSignals(False)
+        self.pose_checkbox.setEnabled(is_depth)
+        self.pose_checkbox.setVisible(is_depth)
+        pose_controls_visible = is_depth and self.pose_checkbox.isChecked()
+        for w in [self.pose_model_label, self.pose_model_combo, self.pose_aug_label, self.pose_aug_combo]:
+            w.setVisible(pose_controls_visible)
+            w.setEnabled(pose_controls_visible)
 
     def _show_cameras(self):
         cams = list_cameras()
