@@ -2,7 +2,6 @@ from typing import Optional, List, Tuple
 import os, time, pathlib, subprocess, platform, re, contextlib
 import numpy as np, cv2
 from PySide6 import QtCore, QtGui, QtWidgets
-from sender_core import StereoSenderClient
 from local_inference import LocalEngineRunner, TensorRTUnavailableError, ensure_tensorrt_runtime
 from main import DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS
 
@@ -99,32 +98,6 @@ def try_get_realsense_fx_baseline() -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
-class ClientWorker(QtCore.QThread):
-    log_signal = QtCore.Signal(str)
-    result_signal = QtCore.Signal(int, str, str, int, int, bytes, dict)
-    start_signal = QtCore.Signal()
-    finish_signal = QtCore.Signal()
-
-    def __init__(self, client: StereoSenderClient, left_src: str, right_src, mode: str, use_realsense: bool):
-        super().__init__()
-        self.client = client
-        self.left_src = left_src
-        self.right_src = right_src
-        self.mode = mode
-        self.use_realsense = use_realsense
-        self.client._on_log = lambda s: self.log_signal.emit(s)
-        self.client._on_result = lambda *args: self.result_signal.emit(*args)
-        self.client._on_start = lambda: self.start_signal.emit()
-        self.client._on_finish = lambda: self.finish_signal.emit()
-
-    def run(self):
-        import asyncio
-        with contextlib.suppress(Exception):
-            asyncio.run(self.client.start_stream(self.left_src, self.right_src, self.mode, self.use_realsense))
-
-    def stop(self):
-        self.client.stop()
-
 class LocalEngineWorker(QtCore.QThread):
     log_signal = QtCore.Signal(str)
     result_signal = QtCore.Signal(int, str, str, int, int, bytes, dict)
@@ -192,7 +165,7 @@ class LocalEngineWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FoundationStereo Sender")
+        self.setWindowTitle("FoundationStereo Local Runner")
         self.setMinimumSize(1024, 740)
 
         w = QtWidgets.QWidget(self)
@@ -204,11 +177,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._disp_vis_alpha_decay = 0.08
         self._reset_preview_state()
 
-        self.host = QtWidgets.QLineEdit("jetson.local")
-        self.port = QtWidgets.QSpinBox(); self.port.setMaximum(83353); self.port.setValue(8765)
-        self.path = QtWidgets.QLineEdit("/foundation-stereo")
-        self.send_to_server = QtWidgets.QCheckBox("Send to server")
-        self.send_to_server.setChecked(False)
         self.engine_file = QtWidgets.QLineEdit()
         self.engine_file.setPlaceholderText("TensorRT engine path")
         self.engine_browse = QtWidgets.QPushButton("Browse TensorRT Engine...")
@@ -253,12 +221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_label.setStyleSheet("background: #111; color: #aaa; border: 1px solid #333")
 
         r = 0
-        layout.addWidget(QtWidgets.QLabel("Host"), r, 0); layout.addWidget(self.host, r, 1)
-        layout.addWidget(QtWidgets.QLabel("Port"), r, 2); layout.addWidget(self.port, r, 3)
-        layout.addWidget(QtWidgets.QLabel("Path"), r, 4); layout.addWidget(self.path, r, 5); r += 1
-
-        layout.addWidget(self.send_to_server, r, 0, 1, 2)
-        layout.addWidget(QtWidgets.QLabel("TensorRT Engine"), r, 2)
+        layout.addWidget(QtWidgets.QLabel("TensorRT Engine"), r, 0)
         layout.addWidget(self.engine_file, r, 3, 1, 2)
         layout.addWidget(self.engine_browse, r, 5); r += 1
 
@@ -299,7 +262,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.preview_label, r, 0, 1, 6); r += 1
         layout.addWidget(self.log_box, r, 0, 1, 6); r += 1
 
-        self.send_to_server.toggled.connect(self._toggle_server_destination)
         self.engine_browse.clicked.connect(self._browse_engine)
         self.src_mode.currentIndexChanged.connect(self._update_source_rows)
         self.show_cams_btn.clicked.connect(self._show_cameras)
@@ -312,9 +274,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
 
-        self.worker: Optional[ClientWorker] = None
+        self.worker: Optional[LocalEngineWorker] = None
         self._update_source_rows()
-        self._toggle_server_destination()
         self._toggle_depth_controls()
         self._toggle_realsense_capture()
 
@@ -323,13 +284,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._disp_preview_max: Optional[float] = None
         self._disp_preview_session: Optional[str] = None
         self._disp_vis_norm: Optional[float] = None
-
-    def _toggle_server_destination(self):
-        send = self.send_to_server.isChecked()
-        for w in [self.host, self.port, self.path]:
-            w.setEnabled(send)
-        self.engine_file.setEnabled(not send)
-        self.engine_browse.setEnabled(not send)
 
     def _browse_engine(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -406,29 +360,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if d: self.save_dir.setText(d)
 
     def _start(self):
-        send_to_server = self.send_to_server.isChecked()
+        if self.worker is not None:
+            self._log("A processing session is already running.")
+            return
         engine_path = self.engine_file.text().strip()
-        if not send_to_server:
-            if not engine_path:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "TensorRT Engine",
-                    "Please select a TensorRT engine before running locally.",
-                )
-                return
-            if not os.path.exists(engine_path):
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "TensorRT Engine",
-                    "Selected TensorRT engine file does not exist.",
-                )
-                return
-            try:
-                ensure_tensorrt_runtime()
-            except TensorRTUnavailableError as exc:
-                QtWidgets.QMessageBox.critical(self, "TensorRT", str(exc))
-                return
-            self._log(f"[local] Selected TensorRT engine: {engine_path}")
+        if not engine_path:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "TensorRT Engine",
+                "Please select a TensorRT engine before running locally.",
+            )
+            return
+        if not os.path.exists(engine_path):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "TensorRT Engine",
+                "Selected TensorRT engine file does not exist.",
+            )
+            return
+        try:
+            ensure_tensorrt_runtime()
+        except TensorRTUnavailableError as exc:
+            QtWidgets.QMessageBox.critical(self, "TensorRT", str(exc))
+            return
+        self._log(f"[local] Selected TensorRT engine: {engine_path}")
         self.depth_fx, self.depth_baseline_m = None, None
         if self.output_mode.currentText() == "Depth":
             if self.use_realsense.isChecked():
@@ -478,45 +433,23 @@ class MainWindow(QtWidgets.QMainWindow):
             mode = "stream"
 
         self._reset_preview_state()
-
-        if send_to_server:
-            host = self.host.text().strip()
-            port = self.port.value()
-            path = self.path.text().strip() or "/foundation-stereo"
-            client = StereoSenderClient(
-                host,
-                port,
-                path,
-                fps = fps,
-                session_id=session_id,
-                frame_width=frame_w,
-                frame_height=frame_h,
-                save_dir=save_dir,
-                preview=preview,
-                on_log=self._log,
-                on_result=self._on_result_image,
-                on_start=lambda: self._set_running(True),
-                on_finish=lambda: self._set_running(False),
-            )
-            self.worker = ClientWorker(client, left_src, right_src, mode, use_realsense)
-        else:
-            self.worker = LocalEngineWorker(
-                engine_path=engine_path,
-                left_src=left_src,
-                right_src=right_src,
-                mode=mode,
-                frame_width=frame_w,
-                frame_height=frame_h,
-                fps=fps,
-                session_id=session_id,
-                save_dir=save_dir,
-                preview=preview,
-                use_realsense=use_realsense
-            )
+        self.worker = LocalEngineWorker(
+            engine_path=engine_path,
+            left_src=left_src,
+            right_src=right_src,
+            mode=mode,
+            frame_width=frame_w,
+            frame_height=frame_h,
+            fps=fps,
+            session_id=session_id,
+            save_dir=save_dir,
+            preview=preview,
+            use_realsense=use_realsense
+        )
         self.worker.log_signal.connect(self._log)
         self.worker.result_signal.connect(self._on_result_image)
-        self.worker.start_signal.connect(lambda: self._set_running(True))
-        self.worker.finish_signal.connect(lambda: self._set_running(False))
+        self.worker.start_signal.connect(lambda: self._handle_worker_started)
+        self.worker.finish_signal.connect(lambda: self._handle_worker_finished)
         self.worker.start()
 
     def _stop(self):
@@ -524,6 +457,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.stop()
         else:
             self._log("No active worker.")
+
+    def _handle_worker_started(self):
+        self._set_running(True)
+
+    def _handle_worker_finished(self):
+        self._set_running(False)
+        self.worker = None
 
     def _set_running(self, running: bool):
         self.start_btn.setEnabled(not running)
