@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import contextlib
 import os
@@ -107,24 +107,34 @@ def try_get_realsense_fx_baseline() -> Optional[Tuple[float, float]]:
         ctx = rs.context()
         if len(ctx.devices) == 0:
             return None
-        for dev in ctx.devices:
-            name = dev.get_info(rs.camera_info.name)
+
+        def _attempt_fetch(left_stream: Tuple[Any, Optional[int]], right_stream: Tuple[Any, Optional[int]]):
             pipe = rs.pipeline()
             cfg = rs.config()
+            ls, ls_idx = left_stream
+            rs_left_args = (ls, ls_idx) if ls_idx is not None else (ls,)
+            rsr, rsr_idx = right_stream
+            rs_right_args = (rsr, rsr_idx) if rsr_idx is not None else (rsr,)
 
-            cfg.enable_stream(rs.stream.left, 640, 480, rs.format.y8, 30)
-            cfg.enable_stream(rs.stream.right, 640, 480, rs.format.y8, 30)
-            profile = pipe.start(cfg)
+            cfg.enable_stream(*rs_left_args, 640, 480, rs.format.y8, 30)
+            cfg.enable_stream(*rs_right_args, 640, 480, rs.format.y8, 30)
+
             try:
-                sp_left = profile.get_stream(rs.stream.left).as_video_stream_profile()
-                sp_right = profile.get_stream(rs.stream.right).as_video_stream_profile()
-                intr = sp_left.get_intrinsics()
-                fx = float(intr.fx)
+                profile = pipe.start(cfg)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    pipe.stop()
+                raise
+            try:
+                left_profile = profile.get_stream(*rs_left_args).as_video_stream_profile()
+                right_profile = profile.get_stream(*rs_right_args).as_video_stream_profile()
 
-                extr = sp_left.get_extrinsics_to(sp_right)
-                baseline_m = float(abs(extr.translation[0]))
-                if fx > 0 and baseline_m > 0:
-                    return fx, baseline_m
+                intr = left_profile.get_intrinsics()
+                fx_val = float(intr.fx)
+                extr = left_profile.get_extrinsics_to(right_profile)
+                baseline_val = float(abs(extr.translation[0]))
+                if fx_val > 0 and baseline_val > 0:
+                    return fx_val, baseline_val
             finally:
                 with contextlib.suppress(Exception):
                     pipe.stop()
