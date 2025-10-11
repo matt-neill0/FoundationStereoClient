@@ -105,12 +105,13 @@ class ClientWorker(QtCore.QThread):
     start_signal = QtCore.Signal()
     finish_signal = QtCore.Signal()
 
-    def __init__(self, client: StereoSenderClient, left_src: str, right_src, mode: str):
+    def __init__(self, client: StereoSenderClient, left_src: str, right_src, mode: str, use_realsense: bool):
         super().__init__()
         self.client = client
         self.left_src = left_src
         self.right_src = right_src
         self.mode = mode
+        self.use_realsense = use_realsense
         self.client._on_log = lambda s: self.log_signal.emit(s)
         self.client._on_result = lambda *args: self.result_signal.emit(*args)
         self.client._on_start = lambda: self.start_signal.emit()
@@ -119,7 +120,7 @@ class ClientWorker(QtCore.QThread):
     def run(self):
         import asyncio
         with contextlib.suppress(Exception):
-            asyncio.run(self.client.start_stream(self.left_src, self.right_src, self.mode))
+            asyncio.run(self.client.start_stream(self.left_src, self.right_src, self.mode, self.use_realsense))
 
     def stop(self):
         self.client.stop()
@@ -141,7 +142,8 @@ class LocalEngineWorker(QtCore.QThread):
         fps: float,
         session_id: str,
         save_dir: Optional[pathlib.Path],
-        preview: bool
+        preview: bool,
+        use_realsense: bool,
     ):
         super().__init__()
         self._start_emitted = False
@@ -172,6 +174,7 @@ class LocalEngineWorker(QtCore.QThread):
             on_result=lambda *a: self.result_signal.emit(*a),
             on_start=_start_wrapper,
             on_finish=_finish_wrapper,
+            use_realsense=use_realsense
         )
 
     def run(self):
@@ -224,17 +227,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output_mode = QtWidgets.QComboBox(); self.output_mode.addItems(["Disparity", "Depth"])
         self.depth_group = QtWidgets.QGroupBox("Depth Options")
         depth_layout = QtWidgets.QGridLayout(self.depth_group)
-        self.use_realsense = QtWidgets.QCheckBox("Use Realsense")
         self.focal_px_edit = QtWidgets.QLineEdit(); self.focal_px_edit.setPlaceholderText("Focal length (pixels)")
         self.baseline_m_edit = QtWidgets.QLineEdit(); self.baseline_m_edit.setPlaceholderText("Baseline (meters)")
         dblv = QtGui.QDoubleValidator(0.0, 1e9, 6, self)
         self.focal_px_edit.setValidator(dblv)
         self.baseline_m_edit.setValidator(dblv)
-        depth_layout.addWidget(self.use_realsense, 0, 0, 1, 2)
-        depth_layout.addWidget(QtWidgets.QLabel("Focal length (px)"), 1, 0)
-        depth_layout.addWidget(self.focal_px_edit, 1, 1)
-        depth_layout.addWidget(QtWidgets.QLabel("Baseline(m)"), 2, 0)
-        depth_layout.addWidget(self.baseline_m_edit, 2, 1)
+        depth_layout.addWidget(QtWidgets.QLabel("Focal length (px)"), 0, 0)
+        depth_layout.addWidget(self.focal_px_edit, 0, 1)
+        depth_layout.addWidget(QtWidgets.QLabel("Baseline(m)"), 1, 0)
+        depth_layout.addWidget(self.baseline_m_edit, 1, 1)
+        depth_layout.setColumnStretch(1, 1)
+
+        self.use_realsense = QtWidgets.QCheckBox("Use RealSense")
 
         self.start_btn = QtWidgets.QPushButton("Start")
         self.stop_btn = QtWidgets.QPushButton("Stop"); self.stop_btn.setEnabled(False)
@@ -258,7 +262,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.engine_file, r, 3, 1, 2)
         layout.addWidget(self.engine_browse, r, 5); r += 1
 
-        layout.addWidget(QtWidgets.QLabel("Source"), r, 0); layout.addWidget(self.src_mode, r, 1, 1, 2); r += 1
+        layout.addWidget(QtWidgets.QLabel("Source"), r, 0); layout.addWidget(self.src_mode, r, 1, 1, 2)
+        layout.addWidget(self.use_realsense, r, 3, 1, 2); r += 1
 
         cam_box = QtWidgets.QHBoxLayout()
         cam_box.addWidget(QtWidgets.QLabel("Left Cam #")); cam_box.addWidget(self.left_cam)
@@ -302,6 +307,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right_browse.clicked.connect(self._browse_right)
         self.save_browse.clicked.connect(self._browse_save)
         self.output_mode.currentIndexChanged.connect(self._toggle_depth_controls)
+        self.use_realsense.toggled.connect(self._toggle_realsense_capture)
         self.use_realsense.toggled.connect(self._toggle_depth_controls)
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
@@ -310,6 +316,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_source_rows()
         self._toggle_server_destination()
         self._toggle_depth_controls()
+        self._toggle_realsense_capture()
 
     def _reset_preview_state(self):
         self._disp_preview_scale = self._disp_preview_default_scale
@@ -335,11 +342,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.engine_file.setText(fn)
 
     def _update_source_rows(self):
-        is_files = (self.src_mode.currentText() == "Video Files")
-        for w in [self.left_cam, self.right_cam]:
-            w.setEnabled(not is_files)
+        use_rs = self.use_realsense.isChecked()
+        is_files = (self.src_mode.currentText() == "Video Files") and not use_rs
+        for w in [self.left_cam, self.right_cam, self.show_cams_btn]:
+            w.setEnabled(not is_files and not use_rs)
         for w in [self.left_file, self.left_browse, self.right_file, self.right_browse]:
             w.setEnabled(is_files)
+
+    def _toggle_realsense_capture(self):
+        use_rs = self.use_realsense.isChecked()
+        if use_rs:
+            if self.src_mode.currentText() != "Live Cameras":
+                self.src_mode.setCurrentIndex(0)
+        self.src_mode.setEnabled(not use_rs)
+        self._update_source_rows()
 
     def _toggle_depth_controls(self):
         is_depth = (self.output_mode.currentText() == "Depth")
@@ -445,7 +461,8 @@ class MainWindow(QtWidgets.QMainWindow):
         session_id = f"gui-{int(time.time())}"
         preview = self.preview.isChecked()
 
-        if self.src_mode.currentText() == "Video Files":
+        use_realsense = self.use_realsense.isChecked()
+        if self.src_mode.currentText() == "Video Files" and not use_realsense:
             left_src = self.left_file.text().strip()
             right_src = self.right_file.text().strip()
             if not (left_src and right_src and os.path.exists(left_src) and os.path.exists(right_src)):
@@ -453,8 +470,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             mode = "file"
         else:
-            left_src = str(self.left_cam.value())
-            right_src = str(self.right_cam.value())
+            if use_realsense:
+                left_src = right_src = "realsense"
+            else:
+                left_src = str(self.left_cam.value())
+                right_src = str(self.right_cam.value())
             mode = "stream"
 
         self._reset_preview_state()
@@ -478,7 +498,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 on_start=lambda: self._set_running(True),
                 on_finish=lambda: self._set_running(False),
             )
-            self.worker = ClientWorker(client, left_src, right_src, mode)
+            self.worker = ClientWorker(client, left_src, right_src, mode, use_realsense)
         else:
             self.worker = LocalEngineWorker(
                 engine_path=engine_path,
@@ -491,6 +511,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 session_id=session_id,
                 save_dir=save_dir,
                 preview=preview,
+                use_realsense=use_realsense
             )
         self.worker.log_signal.connect(self._log)
         self.worker.result_signal.connect(self._on_result_image)
