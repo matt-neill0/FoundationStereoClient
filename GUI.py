@@ -196,6 +196,11 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QGridLayout(w)
         self.setCentralWidget(w)
 
+        self._disp_preview_default_scale = 256.0
+        self._disp_vis_alpha_rise = 0.35
+        self._disp_vis_alpha_decay = 0.08
+        self._reset_preview_state()
+
         self.host = QtWidgets.QLineEdit("jetson.local")
         self.port = QtWidgets.QSpinBox(); self.port.setMaximum(83353); self.port.setValue(8765)
         self.path = QtWidgets.QLineEdit("/foundation-stereo")
@@ -305,6 +310,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_source_rows()
         self._toggle_server_destination()
         self._toggle_depth_controls()
+
+    def _reset_preview_state(self):
+        self._disp_preview_scale = self._disp_preview_default_scale
+        self._disp_preview_max: Optional[float] = None
+        self._disp_preview_session: Optional[str] = None
+        self._disp_vis_norm: Optional[float] = None
 
     def _toggle_server_destination(self):
         send = self.send_to_server.isChecked()
@@ -446,6 +457,8 @@ class MainWindow(QtWidgets.QMainWindow):
             right_src = str(self.right_cam.value())
             mode = "stream"
 
+        self._reset_preview_state()
+
         if send_to_server:
             host = self.host.text().strip()
             port = self.port.value()
@@ -498,20 +511,50 @@ class MainWindow(QtWidgets.QMainWindow):
     def _log(self, msg: str):
         self.log_box.appendPlainText(msg)
 
-    def _visualize_disparity(self, disp_img: np.ndarray) -> np.ndarray:
+    def _decode_disparity(self, disp_img: np.ndarray) -> np.ndarray:
+        disp = disp_img.astype(np.float32)
         if disp_img.dtype == np.uint16:
-            d = disp_img.astype(np.float32)
-            hi = np.percentile(d[d > 0], 99.5) if np.any(d > 0) else 1.0
-            vis = np.clip(d / (hi if hi > 0 else 1.0) * 255.0, 0, 255).astype(np.uint8)
+            scale = self._disp_preview_scale if self._disp_preview_scale and self._disp_preview_scale > 0 else self._disp_preview_default_scale
+            if scale <= 0:
+                scale = 1.0
+            disp = disp / float(scale)
+        disp = np.nan_to_num(disp, nan=0.0, posinf=0.0, neginf=0.0)
+        if self._disp_preview_max is not None:
+            disp = np.clip(disp, 0.0, float(self._disp_preview_max))
         else:
-            vis = disp_img if disp_img.dtype == np.uint8 else cv2.convertScaleAbs(disp_img)
-        vis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
+            disp = np.maximum(disp, 0.0)
+        return disp
+
+    def _visualize_disparity(self, disparity: np.ndarray) -> np.ndarray:
+        disp = np.nan_to_num(disparity.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if self._disp_preview_max is not None:
+            disp = np.clip(disp, 0.0, float(self._disp_preview_max))
+        positives = disp[disp > 0]
+        if positives.size:
+            hi_candidate = float(np.percentile(positives, 99.5))
+            if self._disp_preview_max is not None:
+                hi_candidate = min(hi_candidate, float(self._disp_preview_max))
+        else:
+            hi_candidate = self._disp_preview_max or (self._disp_vis_norm or 1.0)
+        hi_candidate = max(hi_candidate, 1e-3)
+        if self._disp_vis_norm is None:
+            self._disp_vis_norm = hi_candidate
+        else:
+            alpha = self._disp_vis_alpha_rise if hi_candidate > self._disp_vis_norm else self._disp_vis_alpha_decay
+            self._disp_vis_norm = (1 - alpha) * self._disp_vis_norm + alpha * hi_candidate
+        norm = max(self._disp_vis_norm if self._disp_vis_norm else hi_candidate, 1e-3)
+        vis_gray = np.clip((disp / norm) * 255.0, 0.0, 255.0).astype(np.uint8)
+        vis_gray[disp <= 0] = 0
+        vis = cv2.applyColorMap(vis_gray, cv2.COLORMAP_INFERNO)
         return vis
 
-    def _depth_from_disparity(self, disp_img: np.ndarray, fx: float, baseline_m: float) -> np.ndarray:
-        d = disp_img.astype(np.float32)
+    def _depth_from_disparity(self, disparity: np.ndarray, fx: float, baseline_m: float) -> np.ndarray:
+        d = np.nan_to_num(disparity.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         eps = 1e-6
-        depth = (fx * baseline_m) / np.maximum(d, eps)
+        denom = np.maximum(d, eps)
+        depth = (fx * baseline_m) / denom
+        depth[d <= eps] = 0.0
+        depth[~np.isfinite(depth)] = 0.0
         return depth
 
     def _visualize_depth(self, depth_m: np.ndarray) -> np.ndarray:
@@ -528,14 +571,43 @@ class MainWindow(QtWidgets.QMainWindow):
         if img is None:
             return
 
+        meta_payload: dict = {}
+        if isinstance(meta, dict):
+            meta_payload = meta.get("meta") if isinstance(meta.get("meta"), dict) else meta
+        session_id = meta_payload.get("session_id")
+        if session_id is not None:
+            session_str = str(session_id)
+            if session_str != self._disp_preview_session:
+                self._disp_preview_session = session_str
+                self._disp_vis_norm = None
+                self._disp_preview_max = None
+                self._disp_preview_scale = self._disp_preview_default_scale
+
+        def _try_float(value) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        scale_val = _try_float(meta_payload.get("disp_scale"))
+        if scale_val is not None and scale_val > 0:
+            self._disp_preview_scale = scale_val
+        elif self._disp_preview_scale is None or self._disp_preview_scale <= 0:
+            self._disp_preview_scale = self._disp_preview_default_scale
+
+        max_val = _try_float(meta_payload.get("max_disp"))
+        if max_val is not None and max_val > 0:
+            self._disp_preview_max = max_val
+
         want_depth = (self.output_mode.currentText() == "Depth")
         vis: np.ndarray
         if kind == "disparity":
+            disparity = self._decode_disparity(img)
             if want_depth and self.depth_fx and self.depth_baseline_m:
-                depth_m = self._depth_from_disparity(img, self.depth_fx, self.depth_baseline_m)
+                depth_m = self._depth_from_disparity(disparity, self.depth_fx, self.depth_baseline_m)
                 vis = self._visualize_depth(depth_m)
             else:
-                vis = self._visualize_disparity(img)
+                vis = self._visualize_disparity(disparity)
         else:
             if img.dtype == np.uint16:
                 nz = img[img > 0]

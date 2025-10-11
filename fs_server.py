@@ -40,10 +40,16 @@ def disparity_to_png16(disp: np.ndarray, max_disp:float, scale: float) -> bytes:
     d = np.nan_to_num(disp, nan=0.0, posinf=max_disp, neginf=0.0)
     d = np.clip(d, 0.0, max_disp)
     scaled = np.round(d * scale)
+    if d.ndim > 2:
+        d = np.squeeze(d)
+    if d.ndim != 2:
+        raise ValueError(f"Expected 2D disparity map, got shape {disp.shape}")
     if scaled.dtype != np.float32 and scaled.dtype != np.float64:
         scaled = scaled.astype(np.float32, copy=False)
     scaled = np.clip(scaled, 0.0, np.float32(np.iinfo(np.uint16).max))
     d16 = np.ascontiguousarray(scaled.astype(np.uint16))
+    if 0 in d16.shape:
+        raise ValueError(f"Invalid disparity image shape after squeeze: {d16.shape}")
     ok, buf = cv2.imencode(".png", d16)
     if not ok:
         raise RuntimeError("cv2.imencode PNG failed")
@@ -129,6 +135,8 @@ async def handle_ws(ws):
     if start.get("type") != "start":
         await ws.close(); return
     log.info(f"Start: mode={start.get('mode')} fps={start.get('fps')} sender_wh={start.get('width')}x{start.get('height')}")
+    start_meta = start.get("meta") if isinstance(start.get("meta"), dict) else {}
+    session_id = start_meta.get("session_id")
 
     while True:
         head_msg = await ws.recv()
@@ -169,8 +177,12 @@ async def handle_ws(ws):
                 "sender_wh": [int(sw), int(sh)],
                 "aligned32":bool(ALIGN_TO_32),
                 "letterbox": bool(LETTERBOX),
+                "disp_scale": float(SCALE_16U),
+                "max_disp": float(MAX_DISP)
             }
         }
+        if session_id is not None:
+            head_out["meta"]["session_id"] = session_id
         await ws.send(json.dumps(head_out))
         await ws.send(png16)
 
