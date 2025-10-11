@@ -1,7 +1,12 @@
-import asyncio, json, logging
-from typing import Tuple, List, Optional, Dict, Any
-import numpy as np
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Dict, Tuple
+
 import cv2
+import numpy as np
 import onnx
 import onnxruntime as ort
 import websockets

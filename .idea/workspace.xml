@@ -4,10 +4,13 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="35f0f9db-be60-443b-8397-3c5b546279fc" name="Changes" comment="improved gui for realsense usage">
+    <list default="true" id="35f0f9db-be60-443b-8397-3c5b546279fc" name="Changes" comment="Removed server sending functionality to make this a local inferer">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/GUI.py" beforeDir="false" afterPath="$PROJECT_DIR$/GUI.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/sender_core.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/camera_capture.py" beforeDir="false" afterPath="$PROJECT_DIR$/camera_capture.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/fs_server.py" beforeDir="false" afterPath="$PROJECT_DIR$/fs_server.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/local_inference.py" beforeDir="false" afterPath="$PROJECT_DIR$/local_inference.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -153,7 +156,15 @@
       <option name="project" value="LOCAL" />
       <updated>1760171108438</updated>
     </task>
-    <option name="localTasksCounter" value="10" />
+    <task id="LOCAL-00010" summary="Removed server sending functionality to make this a local inferer">
+      <option name="closed" value="true" />
+      <created>1760173022123</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1760173022123</updated>
+    </task>
+    <option name="localTasksCounter" value="11" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -179,7 +190,8 @@
     <MESSAGE value="continued fixes" />
     <MESSAGE value="seperated camera functionality into camera_capture.py&#10;&#10;reworked local_inference.py" />
     <MESSAGE value="improved gui for realsense usage" />
-    <option name="LAST_COMMIT_MESSAGE" value="improved gui for realsense usage" />
+    <MESSAGE value="Removed server sending functionality to make this a local inferer" />
+    <option name="LAST_COMMIT_MESSAGE" value="Removed server sending functionality to make this a local inferer" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/FoundationStereoClient$main.coverage" NAME="main Coverage Results" MODIFIED="1759640591310" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />

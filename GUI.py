@@ -1,12 +1,46 @@
-from typing import Optional, List, Tuple
-import os, time, pathlib, subprocess, platform, re, contextlib
-import numpy as np, cv2
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import List, Optional, Tuple
+
+import contextlib
+import os
+import platform
+import re
+import subprocess
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
-from local_inference import LocalEngineRunner, TensorRTUnavailableError, ensure_tensorrt_runtime
-from main import DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS
+
+from local_inference import (
+    LocalEngineRunner,
+    TensorRTUnavailableError,
+    ensure_tensorrt_runtime,
+)
+from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
+
+VIDEO_FILE_FILTER = "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)"
+
+@dataclass(frozen=True)
+class SessionConfig:
+    engine_path: str
+    left_src: str
+    right_src: str
+    mode: str
+    frame_width: int
+    frame_height: int
+    fps: float
+    session_id: str
+    save_dir: Optional[Path]
+    preview: bool
+    use_realsense: bool
 
 def shutil_which(cmd: str) -> bool:
     from shutil import which
+
     return which(cmd) is not None
 
 def _linux_list_cameras_v4l2() -> List[Tuple[int, str]]:
@@ -114,7 +148,7 @@ class LocalEngineWorker(QtCore.QThread):
         frame_height: int,
         fps: float,
         session_id: str,
-        save_dir: Optional[pathlib.Path],
+        save_dir: Optional[Path],
         preview: bool,
         use_realsense: bool,
     ):
@@ -213,7 +247,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.save_dir = QtWidgets.QLineEdit()
         self.save_browse = QtWidgets.QPushButton("Save to...")
-        self.preview = QtWidgets.QCheckBox("Preview results"); self.stop_btn.setChecked(True)
 
         self.log_box = QtWidgets.QPlainTextEdit(); self.log_box.setReadOnly(True)
         self.preview_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -256,34 +289,171 @@ class MainWindow(QtWidgets.QMainWindow):
         save_box.addWidget(self.save_dir); save_box.addWidget(self.save_browse)
         layout.addLayout(save_box, r, 0, 1, 6); r += 1
 
-        layout.addWidget(self.preview, r, 0, 1, 2)
         layout.addWidget(self.start_btn, r, 4); layout.addWidget(self.stop_btn, r, 5); r += 1
 
         layout.addWidget(self.preview_label, r, 0, 1, 6); r += 1
         layout.addWidget(self.log_box, r, 0, 1, 6); r += 1
 
+        self._connect_signals()
+
+        self.worker: Optional[LocalEngineWorker] = None
+        self._update_source_rows()
+        self._sync_depth_controls()
+        self._toggle_realsense_capture()
+
+    def _connect_signals(self) -> None:
         self.engine_browse.clicked.connect(self._browse_engine)
         self.src_mode.currentIndexChanged.connect(self._update_source_rows)
         self.show_cams_btn.clicked.connect(self._show_cameras)
         self.left_browse.clicked.connect(self._browse_left)
         self.right_browse.clicked.connect(self._browse_right)
         self.save_browse.clicked.connect(self._browse_save)
-        self.output_mode.currentIndexChanged.connect(self._toggle_depth_controls)
+        self.output_mode.currentIndexChanged.connect(self._sync_depth_controls)
         self.use_realsense.toggled.connect(self._toggle_realsense_capture)
-        self.use_realsense.toggled.connect(self._toggle_depth_controls)
+        self.use_realsense.toggled.connect(self._sync_depth_controls)
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
-
-        self.worker: Optional[LocalEngineWorker] = None
-        self._update_source_rows()
-        self._toggle_depth_controls()
-        self._toggle_realsense_capture()
 
     def _reset_preview_state(self):
         self._disp_preview_scale = self._disp_preview_default_scale
         self._disp_preview_max: Optional[float] = None
         self._disp_preview_session: Optional[str] = None
         self._disp_vis_norm: Optional[float] = None
+
+    def _show_message(self, level: str, title: str, text: str) -> None:
+        handlers = {
+            "information": QtWidgets.QMessageBox.information,
+            "warning": QtWidgets.QMessageBox.warning,
+            "critical": QtWidgets.QMessageBox.critical,
+        }
+        handler = handlers.get(level)
+        if handler:
+            handler(self, title, text)
+
+    @staticmethod
+    def _coerce_float(value: object) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+        return None
+
+    def _selected_engine_path(self) -> Optional[Path]:
+        text = self.engine_file.text().strip()
+        if not text:
+            self._show_message(
+                "warning",
+                "TensorRT Engine",
+                "Please select a TensorRT engine before running locally.",
+            )
+            return None
+
+        path = Path(text)
+        if not path.exists():
+            self._show_message(
+                "warning",
+                "TensorRT Engine",
+                "Selected TensorRT engine file does not exist.",
+            )
+            return None
+
+        return path
+
+    def _selected_save_dir(self) -> Optional[Path]:
+        text = self.save_dir.text().strip()
+        if not text:
+            return None
+        return Path(text).expanduser()
+
+    def _maybe_configure_depth_parameters(self) -> None:
+        if self.output_mode.currentText() != "Depth":
+            return
+
+        if self.use_realsense.isChecked():
+            params = try_get_realsense_fx_baseline()
+            if params is None:
+                self._show_message(
+                    "warning",
+                    "RealSense",
+                    "Could not read RealSense intrinsics on this host. Install `pyrealsense2` "
+                    "and connect a supported device, or enter focal length (px) and baseline "
+                    "(m) manually.",
+                )
+            else:
+                self.depth_fx, self.depth_baseline_m = params
+                self._log(
+                    f"[depth] Using RealSense params: fx={self.depth_fx:.2f}, baseline={self.depth_baseline_m:.6f} m"
+                )
+
+        if self.depth_fx is None or self.depth_baseline_m is None:
+            fx = self._coerce_float(self.focal_px_edit.text())
+            bl = self._coerce_float(self.baseline_m_edit.text())
+            if fx is None or bl is None:
+                self._show_message(
+                    "warning",
+                    "Depth parameters",
+                    "Manual depth requires BOTH focal length (pixels) and baseline (meters).",
+                )
+            else:
+                self.depth_fx, self.depth_baseline_m = fx, bl
+                self._log(f"[depth] Using manual params: fx={fx:.2f}, baseline={bl:.6f} m")
+
+    def _determine_sources(
+            self, use_realsense: bool
+    ) -> Optional[Tuple[str, str, str]]:
+        if self.src_mode.currentText() == "Video Files" and not use_realsense:
+            left = self.left_file.text().strip()
+            right = self.right_file.text().strip()
+            if not (left and right):
+                self._log("Please select valid left/right files.")
+                return None
+
+            left_path, right_path = Path(left), Path(right)
+            if not (left_path.exists() and right_path.exists()):
+                self._log("Please select valid left/right files.")
+                return None
+
+            return left, right, "file"
+
+        if use_realsense:
+            return "realsense", "realsense", "stream"
+
+        return str(self.left_cam.value()), str(self.right_cam.value()), "stream"
+
+    def _build_session_config(self, engine_path: Path) -> Optional[SessionConfig]:
+        use_realsense = self.use_realsense.isChecked()
+        sources = self._determine_sources(use_realsense)
+        if sources is None:
+            return None
+
+        left_src, right_src, mode = sources
+        session_id = f"gui-{int(time.time())}"
+
+        return SessionConfig(
+            engine_path=str(engine_path),
+            left_src=left_src,
+            right_src=right_src,
+            mode=mode,
+            frame_width=DEFAULT_WIDTH,
+            frame_height=DEFAULT_HEIGHT,
+            fps=DEFAULT_FPS,
+            session_id=session_id,
+            save_dir=self._selected_save_dir(),
+            preview=False,
+            use_realsense=use_realsense,
+        )
+
+    def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
+        worker.log_signal.connect(self._log)
+        worker.result_signal.connect(self._on_result_image)
+        worker.start_signal.connect(self._handle_worker_started)
+        worker.finish_signal.connect(self._handle_worker_finished)
 
     def _browse_engine(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -311,7 +481,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.src_mode.setEnabled(not use_rs)
         self._update_source_rows()
 
-    def _toggle_depth_controls(self):
+    def _sync_depth_controls(self):
         is_depth = (self.output_mode.currentText() == "Depth")
         self.depth_group.setEnabled(is_depth)
         rs = self.use_realsense.isChecked()
@@ -348,12 +518,18 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def _browse_left(self):
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Left Video", "", "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)")
-        if fn: self.left_file.setText(fn)
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Left Video", "", VIDEO_FILE_FILTER
+        )
+        if fn:
+            self.left_file.setText(fn)
 
     def _browse_right(self):
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Right Video", "", "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)")
-        if fn: self.right_file.setText(fn)
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Right Video", "", VIDEO_FILE_FILTER
+        )
+        if fn:
+            self.right_file.setText(fn)
 
     def _browse_save(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -363,93 +539,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker is not None:
             self._log("A processing session is already running.")
             return
-        engine_path = self.engine_file.text().strip()
-        if not engine_path:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "TensorRT Engine",
-                "Please select a TensorRT engine before running locally.",
-            )
-            return
-        if not os.path.exists(engine_path):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "TensorRT Engine",
-                "Selected TensorRT engine file does not exist.",
-            )
+        engine_path = self._selected_engine_path()
+        if engine_path is None:
             return
         try:
             ensure_tensorrt_runtime()
         except TensorRTUnavailableError as exc:
-            QtWidgets.QMessageBox.critical(self, "TensorRT", str(exc))
+            self._show_message("critical", "TensorRT", str(exc))
             return
         self._log(f"[local] Selected TensorRT engine: {engine_path}")
         self.depth_fx, self.depth_baseline_m = None, None
-        if self.output_mode.currentText() == "Depth":
-            if self.use_realsense.isChecked():
-                params = try_get_realsense_fx_baseline()
-                if params is None:
-                    QtWidgets.QMessageBox.warning(self, "RealSense",
-                        "Could not read RealSense intrinsics on this host. "
-                        "Install `pyrealsense2` and connect a supported device, "
-                        "or enter focal length (px) and baseline (m) manually.")
-                else:
-                    self.depth_fx, self.depth_baseline_m = params
-                    self._log(f"[depth] Using RealSense params: fx={self.depth_fx:.2f}, baseline={self.depth_baseline_m:.6f} m")
-            if self.depth_fx is None or self.depth_baseline_m is None:
-                try:
-                    fx = float(self.focal_px_edit.text()) if self.focal_px_edit.text().strip() else None
-                    bl = float(self.baseline_m_edit.text()) if self.baseline_m_edit.text().strip() else None
-                except ValueError:
-                    fx, bl = None, None
-                if fx is None or bl is None:
-                    QtWidgets.QMessageBox.warning(self, "Depth parameters",
-                                                  "Manual depth requires BOTH focal length (pixels) and baseline (meters).")
-                else:
-                    self.depth_fx, self.depth_baseline_m = fx, bl
-                    self._log(f"[depth] Using manual params: fx={fx:.2f}, baseline={bl:.6f} m")
+        self._maybe_configure_depth_parameters()
 
-        fps = DEFAULT_FPS
-        frame_w, frame_h = DEFAULT_WIDTH, DEFAULT_HEIGHT
-
-        save_dir = pathlib.Path(self.save_dir.text()) if self.save_dir.text().strip() else None
-        session_id = f"gui-{int(time.time())}"
-        preview = self.preview.isChecked()
-
-        use_realsense = self.use_realsense.isChecked()
-        if self.src_mode.currentText() == "Video Files" and not use_realsense:
-            left_src = self.left_file.text().strip()
-            right_src = self.right_file.text().strip()
-            if not (left_src and right_src and os.path.exists(left_src) and os.path.exists(right_src)):
-                self._log("Please select valid left/right files.")
-                return
-            mode = "file"
-        else:
-            if use_realsense:
-                left_src = right_src = "realsense"
-            else:
-                left_src = str(self.left_cam.value())
-                right_src = str(self.right_cam.value())
-            mode = "stream"
+        config = self._build_session_config(engine_path)
+        if config is None:
+            return
 
         self._reset_preview_state()
-        self.worker = LocalEngineWorker(
-            engine_path=engine_path,
-            left_src=left_src,
-            right_src=right_src,
-            mode=mode,
-            frame_width=frame_w,
-            frame_height=frame_h,
-            fps=fps,
-            session_id=session_id,
-            save_dir=save_dir,
-            preview=preview,
-            use_realsense=use_realsense
-        )
-        self.worker.log_signal.connect(self._log)
-        self.worker.result_signal.connect(self._on_result_image)
-        self.worker.start_signal.connect(lambda: self._handle_worker_started)
-        self.worker.finish_signal.connect(lambda: self._handle_worker_finished)
+        self.worker = LocalEngineWorker(**asdict(config))
+        self._attach_worker_signals(self.worker)
         self.worker.start()
 
     def _stop(self):
@@ -463,7 +571,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _handle_worker_finished(self):
         self._set_running(False)
-        self.worker = None
+        sender = self.sender()
+        if sender is self.worker or self.worker is None:
+            self.worker = None
 
     def _set_running(self, running: bool):
         self.start_btn.setEnabled(not running)
@@ -544,19 +654,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._disp_preview_max = None
                 self._disp_preview_scale = self._disp_preview_default_scale
 
-        def _try_float(value) -> Optional[float]:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-
-        scale_val = _try_float(meta_payload.get("disp_scale"))
+        scale_val = self._coerce_float(meta_payload.get("disp_scale"))
         if scale_val is not None and scale_val > 0:
             self._disp_preview_scale = scale_val
         elif self._disp_preview_scale is None or self._disp_preview_scale <= 0:
             self._disp_preview_scale = self._disp_preview_default_scale
 
-        max_val = _try_float(meta_payload.get("max_disp"))
+        max_val = self._coerce_float(meta_payload.get("max_disp"))
         if max_val is not None and max_val > 0:
             self._disp_preview_max = max_val
 

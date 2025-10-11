@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import contextlib
-import pathlib
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
-from typing import Any, Callable, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -17,7 +17,7 @@ try:
 except Exception as exc:  # pragma: no cover - during unit tests CameraCapture may not import
     cam = None
     _CAM_IMPORT_ERROR = exc
-else:
+else:  # pragma: no cover - exercised when camera_capture imports successfully
     _CAM_IMPORT_ERROR = None
 
 class TensorRTUnavailableError(RuntimeError):
@@ -35,15 +35,16 @@ def ensure_tensorrt_runtime():
         return _TRT_MODULE, _CUDA_MODULE
 
     try:
-        import tensorrt as trt
+        import tensorrt as trt  # type: ignore
     except Exception as exc:  # pragma: no cover - depends on environment
         raise TensorRTUnavailableError(
             "TensorRT Python bindings are not available. Install TensorRT before "
             "running local inference."
         ) from exc
+
     try:
-        import pycuda.autoinit  # noqa: F401  # side-effect import
-        import pycuda.driver as cuda
+        import pycuda.autoinit  # type: ignore  # noqa: F401  - side-effect import
+        import pycuda.driver as cuda  # type: ignore
     except Exception as exc:
         raise TensorRTUnavailableError(
             "PyCUDA is required for TensorRT execution. Install pycuda before "
@@ -197,7 +198,7 @@ class LocalEngineRunner:
             frame_height: int,
             session_id: str,
             fps: float = DEFAULT_FPS,
-            save_dir: Optional[pathlib.Path] = None,
+            save_dir: Optional[Path] = None,
             preview: bool = True,
             max_disp: float = 256.0,
             disp_scale: float = 256.0,
@@ -208,7 +209,7 @@ class LocalEngineRunner:
             on_start: Optional[Callable[[], None]] = None,
             on_finish: Optional[Callable[[], None]] = None,
             use_realsense: Optional[bool] = None,
-    ):
+    ) -> None:
         if mode not in {"stream", "file"}:
             raise ValueError("mode must be either 'stream' or 'file'")
 
@@ -232,6 +233,7 @@ class LocalEngineRunner:
         self._stop_event = threading.Event()
         self._capture_started = False
         self._use_realsense = self._determine_realsense_flag(use_realsense)
+        self._save_dir_prepared = False
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
         if override is not None:
@@ -242,10 +244,9 @@ class LocalEngineRunner:
         realsense_tokens = {"rs", "realsense", "d435", "d455"}
         return bool(tokens & realsense_tokens)
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop_event.set()
-        if cam is not None:
-            cam.signal_stop()
+        self._stop_capture_threads()
 
     def _log(self, msg: str) -> None:
         try:
@@ -281,12 +282,27 @@ class LocalEngineRunner:
             )
         self._capture_started = True
 
-    def _fetch_frames_stream(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _stream_from_cameras(self) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         assert cam is not None
-        left, right = cam.get_frames()
-        return left, right
+        self._start_camera_threads()
+        if self._use_realsense:
+            try:
+                fx_px, baseline_m = cam.get_calibration()
+                self._log(
+                    f"[local] RealSense calibration: fx={fx_px:.1f} baseline={baseline_m:.4f}m"
+                )
+            except Exception as exc:
+                self._log(f"[local] Failed to fetch RealSense calibration: {exc}")
 
-    def _open_video_files(self) -> Tuple[cv2.VideoCapture, cv2.VideoCapture]:
+        while not self._stop_event.is_set():
+            left, right = cam.get_frames()
+            if left is None or right is None:
+                if self._stop_event.wait(timeout=0.005):
+                    break
+                continue
+            yield left, right
+
+    def _stream_from_files(self) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         cap_left = cv2.VideoCapture(self.left_src)
         cap_right = cv2.VideoCapture(self.right_src)
         if not (cap_left.isOpened() and cap_right.isOpened()):
@@ -294,148 +310,154 @@ class LocalEngineRunner:
                 cap_left.release()
                 cap_right.release()
             raise RuntimeError("Failed to open one or both video files")
-        return cap_left, cap_right
+        try:
+            while not self._stop_event.is_set():
+                ok_l, frame_l = cap_left.read()
+                ok_r, frame_r = cap_right.read()
+                if not ok_l or not ok_r or frame_l is None or frame_r is None:
+                    self._log("[local] End of video files.")
+                    break
+                yield frame_l, frame_r
+        finally:
+            with contextlib.suppress(Exception):
+                cap_left.release()
+            with contextlib.suppress(Exception):
+                cap_right.release()
 
-    def _read_from_files(
-            self, cap_left: cv2.VideoCapture, cap_right: cv2.VideoCapture
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        ok_l, frame_l = cap_left.read()
-        ok_r, frame_r = cap_right.read()
-        if not ok_l or not ok_r or frame_l is None or frame_r is None:
-            return None, None
-        return frame_l, frame_r
+    def _frame_stream(self) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+        if self.mode == "stream":
+            yield from self._stream_from_cameras()
+        else:
+            yield from self._stream_from_files()
 
     def _resize_frame(self, frame: np.ndarray) -> np.ndarray:
         if frame.shape[1] == self.frame_width and frame.shape[0] == self.frame_height:
             return frame
         return cv2.resize(frame, (self.frame_width, self.frame_height), interpolation=cv2.INTER_AREA)
 
-    def run(self):
+    def _prepare_pair(self, left: np.ndarray, right: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        left_r = self._resize_frame(left)
+        right_r = self._resize_frame(right)
+
+        if left_r.ndim == 2:
+            left_bgr = cv2.cvtColor(left_r, cv2.COLOR_GRAY2BGR)
+        else:
+            left_bgr = left_r
+
+        if right_r.ndim == 2:
+            right_bgr = cv2.cvtColor(right_r, cv2.COLOR_GRAY2BGR)
+        else:
+            right_bgr = right_r
+
+        return left_bgr, right_bgr
+
+    def _encode_disparity(self, disp: np.ndarray) -> bytes:
+        try:
+            return disparity_to_png16(disp, self.max_disp, self.disp_scale)
+        except Exception as exc:
+            self._log(f"[local] Failed to encode disparity: {exc}")
+            raise
+
+    def _emit_result(self, seq: int, png16: bytes) -> None:
+        meta = {
+            "session_id": self.session_id,
+            "source_mode": self.mode,
+            "sender_wh": [int(self.frame_width), int(self.frame_height)],
+            "realsense": bool(self._use_realsense),
+        }
+        self.on_result(
+            seq,
+            "disparity",
+            "png16",
+            int(self.frame_width),
+            int(self.frame_height),
+            png16,
+            meta,
+        )
+
+    def _ensure_save_dir(self) -> None:
+        if self.save_dir is None or self._save_dir_prepared:
+            return
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._save_dir_prepared = True
+
+    def _save_result(self, seq: int, png16: bytes) -> None:
+        if self.save_dir is None:
+            return
+        self._ensure_save_dir()
+        fname = self.save_dir / f"disparity_seq{seq:06d}.png"
+        with open(fname, "wb") as f:
+            f.write(png16)
+
+    def _render_preview(self, left_bgr: np.ndarray, disp: np.ndarray, fps: float) -> bool:
+        if not self.preview:
+            return False
+        disp_color = _normalize_for_display(disp)
+        combo = np.hstack((left_bgr, disp_color))
+        cv2.putText(
+            combo,
+            f"{fps:.1f} FPS",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+        )
+        cv2.imshow("FoundationStereo TensorRT", combo)
+        if cv2.waitKey(1) & 0xFF == 27:
+            self._log("[local] ESC pressed – stopping preview")
+            return True
+        return False
+
+    def _respect_frame_rate(self, next_deadline: float, interval: float) -> float:
+        if interval <= 0.0:
+            return next_deadline
+        next_deadline += interval
+        sleep_s = next_deadline - time.perf_counter()
+        if sleep_s > 0 and self._stop_event.wait(timeout=sleep_s):
+            return next_deadline
+        return next_deadline
+
+    def _stop_capture_threads(self) -> None:
+        if self._capture_started and cam is not None:
+            cam.signal_stop()
+
+    def _cleanup_after_run(self) -> None:
+        if self.preview:
+            cv2.destroyAllWindows()
+        self._stop_capture_threads()
+
+    def run(self) -> None:
         self._stop_event.clear()
         with push_cuda_context():
             pipeline = self._prepare_engine()
             self.on_start()
-            if self.mode == "stream":
-                self._start_camera_threads()
-                if self._use_realsense:
-                    try:
-                        fx_px, baseline_m = cam.get_calibration()
-                        self._log(
-                            f"[local] RealSense calibration: fx={fx_px:.1f} baseline={baseline_m:.4f}m"
-                        )
-                    except Exception as exc:
-                        self._log(f"[local] Failed to fetch RealSense calibration: {exc}")
-                cap_left = cap_right = None
-            else:
-                cap_left, cap_right = self._open_video_files()
+            seq = 0
+            frame_interval = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.0
+            next_deadline = time.perf_counter()
             try:
-                seq = 0
-                frame_interval = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.0
-                next_t = time.perf_counter()
+                for left_raw, right_raw in self._frame_stream():
+                    if self._stop_event.is_set():
+                        break
+                    left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
 
-                while not self._stop_event.is_set():
-                    if self.mode == "stream":
-                        left, right = self._fetch_frames_stream()
-                        if left is None or right is None:
-                            time.sleep(0.005)
-                            continue
-                    else:
-                        assert cap_left is not None and cap_right is not None
-                        left, right = self._read_from_files(cap_left, cap_right)
-                        if left is None or right is None:
-                            self._log("[local] End of video files.")
-                            break
-
-                    left = self._resize_frame(left)
-                    right = self._resize_frame(right)
-
-                    if left.ndim == 2:
-                        left_bgr = cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
-                    else:
-                        left_bgr = left
-                    if right.ndim == 2:
-                        right_bgr = cv2.cvtColor(right, cv2.COLOR_GRAY2BGR)
-                    else:
-                        right_bgr = right
-
-                    start = time.time()
+                    start = time.perf_counter()
                     disp = pipeline.infer(left_bgr, right_bgr)
-                    fps = 1.0 / max(time.time() - start, 1e-6)
+                    fps = 1.0 / max(time.perf_counter() - start, 1e-6)
 
-                    try:
-                        png16 = disparity_to_png16(disp, self.max_disp, self.disp_scale)
-                    except Exception as exc:
-                        self._log(f"[local] Failed ot encode disparity: {exc}")
-                        raise
+                    png16 = self._encode_disparity(disp)
+                    self._emit_result(seq, png16)
+                    self._save_result(seq, png16)
 
-                    meta = {
-                        "session_id": self.session_id,
-                        "source_mode": self.mode,
-                        "sender_wh": [int(self.frame_width), int(self.frame_height)],
-                        "realsense": bool(self._use_realsense),
-                    }
-
-                    self.on_result(
-                        seq,
-                        "disparity",
-                        "png16",
-                        int(self.frame_width),
-                        int(self.frame_height),
-                        png16,
-                        meta,
-                    )
-
-                    if self.save_dir:
-                        self.save_dir.mkdir(parents=True, exist_ok=True)
-                        fname = self.save_dir / f"disparity_seq{seq:06d}.png"
-                        with open(fname, "wb") as f:
-                            f.write(png16)
-
-                    if self.preview:
-                        disp_color = _normalize_for_display(disp)
-                        combo = np.hstack((left_bgr, disp_color))
-                        cv2.putText(
-                            combo,
-                            f"{fps:.1f} FPS",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1.0,
-                            (0, 255, 0),
-                            2,
-                        )
-                        cv2.imshow("FoundationStereo TensorRT", combo)
-                        if cv2.waitKey(1) & 0xFF == 27:
-                            self._log("[local] ESC pressed – stopping preview")
-                            break
+                    if self._render_preview(left_bgr, disp, fps):
+                        break
 
                     seq += 1
-
                     if frame_interval > 0.0:
-                        next_t += frame_interval
-                        sleep_s = next_t - time.perf_counter()
-                        if sleep_s > 0:
-                            if self._stop_event.wait(timeout=sleep_s):
-                                break
+                        next_deadline = self._respect_frame_rate(next_deadline, frame_interval)
+                        if self._stop_event.is_set():
+                            break
 
             finally:
-                if self.preview:
-                    cv2.destroyAllWindows()
-                if self.mode == "file":
-                    with contextlib.suppress(Exception):
-                        if cap_left is not None:
-                            cap_left.release()
-                    with contextlib.suppress(Exception):
-                        if cap_right is not None:
-                            cap_right.release()
-                if self._capture_started and cam is not None:
-                    cam.signal_stop()
+                self._cleanup_after_run()
                 self.on_finish()
-
-
-
-
-
-
-
-
-

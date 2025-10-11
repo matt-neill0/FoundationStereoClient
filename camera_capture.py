@@ -1,5 +1,10 @@
-import cv2, threading, time
+from __future__ import annotations
+
+import threading
+import time
 from typing import List, Optional
+
+import cv2
 import numpy as np
 
 try:

@@ -1,4 +1,11 @@
-import argparse, pathlib, time, os, sys
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Tuple
 
 DEFAULT_HEIGHT = 480
 DEFAULT_WIDTH = 640
@@ -23,34 +30,49 @@ def build_arg_parser():
     p.add_argument("--disp-scale", type=float, default=256.0, help="Scale factor applied before encoding disparity to PNG16.")
     return p
 
-def main_cli(args):
+def _resolve_sources(args) -> Tuple[str, str, str]:
     if args.use_realsense and (args.left_file or args.right_file):
-        print("--use-realsense cannot be combined with video file inputs.", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError("--use-realsense cannot be combined with video file inputs.")
 
     if args.use_realsense:
-        left_src = right_src = "realsense"
-        mode = "stream"
-    elif args.left_cam is not None and args.right_cam is not None:
-        left_src, right_src, mode = str(args.left_cam), str(args.right_cam), "stream"
-    elif args.left_file and args.right_file:
-        if not (os.path.exists(args.left_file) and os.path.exists(args.right_file)):
-            print("File paths are invalid.", file=sys.stderr); sys.exit(2)
-        left_src, right_src, mode = args.left_file, args.right_file, "file"
-    else:
-        print(
-            "Specify either --left-cam/--right-cam, --left-file/--right-file, or --use-realsense",
-            file=sys.stderr,
-        )
+        return "realsense", "realsense", "stream"
+
+    if args.left_cam is not None and args.right_cam is not None:
+        return str(args.left_cam), str(args.right_cam), "stream"
+
+    if args.left_file and args.right_file:
+        left_path = Path(args.left_file)
+        right_path = Path(args.right_file)
+        if not (left_path.exists() and right_path.exists()):
+            raise ValueError("File paths are invalid.")
+        return str(left_path), str(right_path), "file"
+
+    raise ValueError(
+        "Specify either --left-cam/--right-cam, --left-file/--right-file, or --use-realsense."
+    )
+
+def main_cli(args):
+    from local_inference import (
+        LocalEngineRunner,
+        TensorRTUnavailableError,
+        ensure_tensorrt_runtime,
+    )
+
+    try:
+        left_src, right_src, mode = _resolve_sources(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
         sys.exit(2)
 
-    engine_path = args.engine
-    if not engine_path:
+    if not args.engine:
         print("--engine is required when running without the GUI.", file=sys.stderr)
         sys.exit(2)
-    if not os.path.exists(engine_path):
+
+    engine_path = Path(args.engine)
+    if not engine_path.exists():
         print(f"TensorRT engine not found: {engine_path}", file=sys.stderr)
         sys.exit(2)
+
     try:
         ensure_tensorrt_runtime()
     except TensorRTUnavailableError as exc:
@@ -58,10 +80,10 @@ def main_cli(args):
         sys.exit(1)
 
     session_id = args.session_id or f"local-{int(time.time())}"
+    save_dir = Path(args.save_dir).expanduser() if args.save_dir else None
 
-    save_dir = pathlib.Path(args.save_dir) if args.save_dir else None
     runner = LocalEngineRunner(
-        engine_path=engine_path,
+        engine_path=str(engine_path),
         left_src=left_src,
         right_src=right_src,
         mode=mode,
@@ -69,6 +91,10 @@ def main_cli(args):
         frame_height=args.frame_height or DEFAULT_HEIGHT,
         fps=args.fps or DEFAULT_FPS,
         session_id=session_id,
+        save_dir=save_dir,
+        preview=bool(args.preview),
+        max_disp=args.max_disp,
+        disp_scale=args.disp_scale,
         on_log=lambda s: print(s),
         on_result=lambda *a: print(
             f"[result] seq={a[0]} kind={a[1]} enc={a[2]} {a[3]}x{a[4]} bytes={len(a[5])}"
@@ -82,11 +108,6 @@ def main_cli(args):
         pass
 
 if __name__ == "__main__":
-    from local_inference import (
-        LocalEngineRunner,
-        TensorRTUnavailableError,
-        ensure_tensorrt_runtime,
-    )
     ap = build_arg_parser()
     args = ap.parse_args()
     if args.gui:
