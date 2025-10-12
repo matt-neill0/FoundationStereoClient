@@ -4,9 +4,11 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="35f0f9db-be60-443b-8397-3c5b546279fc" name="Changes" comment="Fixed depth preview display">
+    <list default="true" id="35f0f9db-be60-443b-8397-3c5b546279fc" name="Changes" comment="Added GUI elements ready for pose estimation pipeline">
+      <change afterPath="$PROJECT_DIR$/pose_augmentation.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/GUI.py" beforeDir="false" afterPath="$PROJECT_DIR$/GUI.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/local_inference.py" beforeDir="false" afterPath="$PROJECT_DIR$/local_inference.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -176,7 +178,15 @@
       <option name="project" value="LOCAL" />
       <updated>1760180555192</updated>
     </task>
-    <option name="localTasksCounter" value="13" />
+    <task id="LOCAL-00013" summary="Added GUI elements ready for pose estimation pipeline">
+      <option name="closed" value="true" />
+      <created>1760182360829</created>
+      <option name="number" value="00013" />
+      <option name="presentableId" value="LOCAL-00013" />
+      <option name="project" value="LOCAL" />
+      <updated>1760182360829</updated>
+    </task>
+    <option name="localTasksCounter" value="14" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -205,7 +215,8 @@
     <MESSAGE value="Removed server sending functionality to make this a local inferer" />
     <MESSAGE value="Fixed preview&#10;&#10;Streamlined scripts" />
     <MESSAGE value="Fixed depth preview display" />
-    <option name="LAST_COMMIT_MESSAGE" value="Fixed depth preview display" />
+    <MESSAGE value="Added GUI elements ready for pose estimation pipeline" />
+    <option name="LAST_COMMIT_MESSAGE" value="Added GUI elements ready for pose estimation pipeline" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/FoundationStereoClient$main.coverage" NAME="main Coverage Results" MODIFIED="1759640591310" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />

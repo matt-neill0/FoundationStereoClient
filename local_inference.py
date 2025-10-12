@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
+from pose_augmentation import get_pose_augmentation_info, get_pose_model_info
 
 try:
     import camera_capture as cam
@@ -209,6 +210,9 @@ class LocalEngineRunner:
             on_start: Optional[Callable[[], None]] = None,
             on_finish: Optional[Callable[[], None]] = None,
             use_realsense: Optional[bool] = None,
+            pose_enabled: bool = False,
+            pose_model: Optional[str] = None,
+            pose_augmentation: Optional[str] = None,
     ) -> None:
         if mode not in {"stream", "file"}:
             raise ValueError("mode must be either 'stream' or 'file'")
@@ -225,6 +229,9 @@ class LocalEngineRunner:
         self.preview = preview
         self.max_disp = max_disp
         self.disp_scale = disp_scale
+        self.pose_enabled = bool(pose_enabled)
+        self.pose_model = pose_model
+        self.pose_augmentation = pose_augmentation
         self.on_log = on_log or (lambda s: None)
         self.on_result = on_result or (lambda *args: None)
         self.on_start = on_start or (lambda: None)
@@ -234,6 +241,7 @@ class LocalEngineRunner:
         self._capture_started = False
         self._use_realsense = self._determine_realsense_flag(use_realsense)
         self._save_dir_prepared = False
+        self._log_pose_configuration()
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
         if override is not None:
@@ -253,6 +261,57 @@ class LocalEngineRunner:
             self.on_log(msg)
         except Exception:
             print(msg)
+
+    def _pose_metadata(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"enabled": bool(self.pose_enabled)}
+        if not self.pose_enabled:
+            return data
+
+        model_info = get_pose_model_info(self.pose_model)
+        if self.pose_model is not None:
+            data["model"] = self.pose_model
+        if model_info is not None:
+            data["model_display"] = model_info.display_name
+            data["model_description"] = model_info.description
+
+        aug_info = get_pose_augmentation_info(self.pose_augmentation)
+        if self.pose_augmentation is not None:
+            data["augmentation"] = self.pose_augmentation
+        if aug_info is not None:
+            data["augmentation_display"] = aug_info.display_name
+            data["augmentation_description"] = aug_info.description
+            if aug_info.components:
+                data["augmentation_components"] = list(aug_info.components)
+
+        return data
+
+    def _log_pose_configuration(self) -> None:
+        if not self.pose_enabled:
+            self._log("[pose] Depth-guided pose augmentation disabled.")
+            return
+
+        model_info = get_pose_model_info(self.pose_model)
+        if model_info is not None:
+            self._log(
+                f"[pose] Using {model_info.display_name} pose model ({model_info.key})."
+            )
+        elif self.pose_model:
+            self._log(f"[pose] Pose model '{self.pose_model}' is not recognised.")
+        else:
+            self._log("[pose] Pose estimation enabled without an explicit model key.")
+
+        aug_info = get_pose_augmentation_info(self.pose_augmentation)
+        if aug_info is not None:
+            self._log(
+                f"[pose] Augmentation: {aug_info.display_name} ({aug_info.key})."
+            )
+            if aug_info.components:
+                joined = ", ".join(aug_info.components)
+                self._log(f"[pose] Components: {joined}")
+        elif self.pose_augmentation:
+            self._log(
+                f"[pose] Augmentation key '{self.pose_augmentation}' is not recognised."
+            )
 
     def _prepare_engine(self) -> TensorRTPipeline:
         self._log(f"[local] Loading TensorRT engine: {self.engine_path}")
@@ -365,6 +424,7 @@ class LocalEngineRunner:
             "sender_wh": [int(self.frame_width), int(self.frame_height)],
             "realsense": bool(self._use_realsense),
         }
+        meta["pose"] = self._pose_metadata()
         self.on_result(
             seq,
             "disparity",

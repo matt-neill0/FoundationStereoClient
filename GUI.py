@@ -20,6 +20,8 @@ from local_inference import (
     TensorRTUnavailableError,
     ensure_tensorrt_runtime,
 )
+
+from pose_augmentation import list_pose_augmentations, list_pose_models
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
 
 VIDEO_FILE_FILTER = "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)"
@@ -164,6 +166,9 @@ class LocalEngineWorker(QtCore.QThread):
         save_dir: Optional[Path],
         preview: bool,
         use_realsense: bool,
+        pose_enabled: bool = False,
+        pose_model: Optional[str] = None,
+        pose_augmentation: Optional[str] = None,
     ):
         super().__init__()
         self._start_emitted = False
@@ -194,7 +199,10 @@ class LocalEngineWorker(QtCore.QThread):
             on_result=lambda *a: self.result_signal.emit(*a),
             on_start=_start_wrapper,
             on_finish=_finish_wrapper,
-            use_realsense=use_realsense
+            use_realsense=use_realsense,
+            pose_enabled=pose_enabled,
+            pose_model=pose_model,
+            pose_augmentation=pose_augmentation,
         )
 
     def run(self):
@@ -253,19 +261,17 @@ class MainWindow(QtWidgets.QMainWindow):
         depth_layout.addWidget(self.baseline_m_edit, 1, 1)
         self.pose_checkbox = QtWidgets.QCheckBox("Feed depth into pose estimation")
         self.pose_model_label = QtWidgets.QLabel("Pose model")
-        self.pose_model_combo = QtWidgets.QComboBox();
-        self.pose_model_combo.addItems([
-            "OpenPose",
-            "MoveNet",
-            "BlazePose",
-        ])
+        self.pose_model_combo = QtWidgets.QComboBox()
+        for info in list_pose_models():
+            self.pose_model_combo.addItem(info.display_name, info.key)
+            idx = self.pose_model_combo.count() - 1
+            self.pose_model_combo.setItemData(idx, info.description, QtCore.Qt.ItemDataRole.ToolTipRole)
         self.pose_aug_label = QtWidgets.QLabel("Augmentation method")
-        self.pose_aug_combo = QtWidgets.QComboBox();
-        self.pose_aug_combo.addItems([
-            "Pre-processing",
-            "Early-fusion",
-            "Mid/Late fusion",
-        ])
+        self.pose_aug_combo = QtWidgets.QComboBox()
+        for info in list_pose_augmentations():
+            self.pose_aug_combo.addItem(info.display_name, info.key)
+            idx = self.pose_aug_combo.count() - 1
+            self.pose_aug_combo.setItemData(idx, info.description, QtCore.Qt.ItemDataRole.ToolTipRole)
         depth_layout.addWidget(self.pose_checkbox, 2, 0, 1, 2)
         depth_layout.addWidget(self.pose_model_label, 3, 0)
         depth_layout.addWidget(self.pose_model_combo, 3, 1)
@@ -470,8 +476,16 @@ class MainWindow(QtWidgets.QMainWindow):
         session_id = f"gui-{int(time.time())}"
 
         pose_enabled = (self.output_mode.currentText() == "Depth") and self.pose_checkbox.isChecked()
-        pose_model = self.pose_model_combo.currentText() if pose_enabled else None
-        pose_augmentation = self.pose_aug_combo.currentText() if pose_enabled else None
+        pose_model = (
+            self.pose_model_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
+            if pose_enabled
+            else None
+        )
+        pose_augmentation = (
+            self.pose_aug_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
+            if pose_enabled
+            else None
+        )
 
         return SessionConfig(
             engine_path=str(engine_path),
