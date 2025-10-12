@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from torch import Tensor
 import torch.nn as nn
+import cv2
 
 # ---------------------------------------------------------------------------
 # Registries used by the GUI / orchestration layer

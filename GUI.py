@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import contextlib
 import os
 import platform
 import re
 import subprocess
 import time
+import shutil
 from pathlib import Path
 
 import cv2
@@ -20,7 +20,6 @@ from local_inference import (
     TensorRTUnavailableError,
     ensure_tensorrt_runtime,
 )
-
 from pose_augmentation import list_pose_augmentations, list_pose_models
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
 
@@ -42,11 +41,6 @@ class SessionConfig:
     pose_enabled: bool = False
     pose_model: Optional[str] = None
     pose_augmentation: Optional[str] = None
-
-def shutil_which(cmd: str) -> bool:
-    from shutil import which
-
-    return which(cmd) is not None
 
 def _linux_list_cameras_v4l2() -> List[Tuple[int, str]]:
     try:
@@ -97,55 +91,12 @@ def _probe_indices_fallback(max_idx: int = 10) -> List[Tuple[int, str]]:
 
 def list_cameras() -> List[Tuple[int, str]]:
     is_linux = (platform.system().lower() == "linux")
-    if is_linux and shutil_which("v4l2-ctl"):
+    if is_linux and shutil.which("v4l2-ctl"):
         cams = _linux_list_cameras_v4l2()
         if cams:
             return cams
     return _probe_indices_fallback(10)
 
-def try_get_realsense_fx_baseline() -> Optional[Tuple[float, float]]:
-    try:
-        import pyrealsense2 as rs
-    except Exception:
-        return None
-    try:
-        ctx = rs.context()
-        if len(ctx.devices) == 0:
-            return None
-
-        def _attempt_fetch(left_stream: Tuple[Any, Optional[int]], right_stream: Tuple[Any, Optional[int]]):
-            pipe = rs.pipeline()
-            cfg = rs.config()
-            ls, ls_idx = left_stream
-            rs_left_args = (ls, ls_idx) if ls_idx is not None else (ls,)
-            rsr, rsr_idx = right_stream
-            rs_right_args = (rsr, rsr_idx) if rsr_idx is not None else (rsr,)
-
-            cfg.enable_stream(*rs_left_args, 640, 480, rs.format.y8, 30)
-            cfg.enable_stream(*rs_right_args, 640, 480, rs.format.y8, 30)
-
-            try:
-                profile = pipe.start(cfg)
-            except Exception:
-                with contextlib.suppress(Exception):
-                    pipe.stop()
-                raise
-            try:
-                left_profile = profile.get_stream(*rs_left_args).as_video_stream_profile()
-                right_profile = profile.get_stream(*rs_right_args).as_video_stream_profile()
-
-                intr = left_profile.get_intrinsics()
-                fx_val = float(intr.fx)
-                extr = left_profile.get_extrinsics_to(right_profile)
-                baseline_val = float(abs(extr.translation[0]))
-                if fx_val > 0 and baseline_val > 0:
-                    return fx_val, baseline_val
-            finally:
-                with contextlib.suppress(Exception):
-                    pipe.stop()
-        return None
-    except Exception:
-        return None
 
 class LocalEngineWorker(QtCore.QThread):
     log_signal = QtCore.Signal(str)
@@ -415,34 +366,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.output_mode.currentText() != "Depth":
             return
 
-        if self.use_realsense.isChecked():
-            params = try_get_realsense_fx_baseline()
-            if params is None:
-                self._show_message(
-                    "warning",
-                    "RealSense",
-                    "Could not read RealSense intrinsics on this host. Install `pyrealsense2` "
-                    "and connect a supported device, or enter focal length (px) and baseline "
-                    "(m) manually.",
-                )
-            else:
-                self.depth_fx, self.depth_baseline_m = params
-                self._log(
-                    f"[depth] Using RealSense params: fx={self.depth_fx:.2f}, baseline={self.depth_baseline_m:.6f} m"
-                )
-
         if self.depth_fx is None or self.depth_baseline_m is None:
             fx = self._coerce_float(self.focal_px_edit.text())
             bl = self._coerce_float(self.baseline_m_edit.text())
-            if fx is None or bl is None:
+            if (fx is None or bl is None) and not self.use_realsense.isChecked():
                 self._show_message(
                     "warning",
                     "Depth parameters",
                     "Manual depth requires BOTH focal length (pixels) and baseline (meters).",
                 )
-            else:
-                self.depth_fx, self.depth_baseline_m = fx, bl
-                self._log(f"[depth] Using manual params: fx={fx:.2f}, baseline={bl:.6f} m")
 
     def _determine_sources(
             self, use_realsense: bool
@@ -701,15 +633,13 @@ class MainWindow(QtWidgets.QMainWindow):
         vis = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
         return vis
 
-    def _on_result_image(self, seq: int, kind: str, enc: str, w: int, h: int, payload: bytes, meta: dict):
+    def _on_result_image(self, payload: bytes, meta: dict):
         arr = np.frombuffer(payload, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
         if img is None:
             return
 
-        meta_payload: dict = {}
-        if isinstance(meta, dict):
-            meta_payload = meta.get("meta") if isinstance(meta.get("meta"), dict) else meta
+        meta_payload: dict = meta if isinstance(meta, dict) else {}
         session_id = meta_payload.get("session_id")
         if session_id is not None:
             session_str = str(session_id)
@@ -729,25 +659,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if max_val is not None and max_val > 0:
             self._disp_preview_max = max_val
 
+        if self.use_realsense.isChecked():
+            fx_px = self._coerce_float(meta_payload.get("fx_px"))
+            bl_m = self._coerce_float(meta_payload.get("baseline_m"))
+            if fx_px and bl_m and (self.depth_fx is None or self.depth_baseline_m is None):
+                self.depth_fx, self.depth_baseline_m = fx_px, bl_m
+                self._log(f"[depth] RealSense calibration received: fx={fx_px:.2f}, baseline={bl_m:.6f} m")
+
         want_depth = (self.output_mode.currentText() == "Depth")
-        vis: np.ndarray
-        if kind == "disparity":
-            disparity = self._decode_disparity(img)
-            if want_depth and self.depth_fx and self.depth_baseline_m:
-                depth_m = self._depth_from_disparity(disparity, self.depth_fx, self.depth_baseline_m)
-                vis = self._visualize_depth(depth_m)
-            else:
-                vis = self._visualize_disparity(disparity)
+        disparity = self._decode_disparity(img)
+        if want_depth and self.depth_fx and self.depth_baseline_m:
+            depth_m = self._depth_from_disparity(disparity, self.depth_fx, self.depth_baseline_m)
+            vis = self._visualize_depth(depth_m)
         else:
-            if img.dtype == np.uint16:
-                nz = img[img > 0]
-                m = nz.mean() if nz.size else 1.0
-                disp = np.clip((img.astype(np.float32) / (3.0 * m)) * 255.0, 0, 255).astype(np.uint8)
-                vis = cv2.applyColorMap(disp, cv2.COLORMAP_INFERNO)
-            else:
-                vis = img
-                if vis.ndim == 2:
-                    vis = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
+            vis = self._visualize_disparity(disparity)
 
         if vis.ndim == 2:
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)

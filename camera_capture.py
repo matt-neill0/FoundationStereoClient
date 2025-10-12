@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from typing import List, Optional
@@ -100,10 +101,7 @@ def capture_realsense() -> None:
                 _ready.set()
 
             while not _stop_flag:
-                if not pipeline.poll_for_frames():
-                    time.sleep(0.002)
-                    continue
-                frames = pipeline.wait_for_frames(timeout_ms=100)
+                frames = pipeline.wait_for_frames(timeout_ms=250)
                 ir_l = frames.get_infrared_frame(1)
                 ir_r = frames.get_infrared_frame(2)
                 if not ir_l or not ir_r:
@@ -114,10 +112,11 @@ def capture_realsense() -> None:
 
         except Exception as e:  # pragma: no cover - hardware error path
             print(f"[CameraCapture] RealSense error → {e}")
-            pipeline.stop()
-            time.sleep(0.5)
-        else:
-            pipeline.stop()
+        finally:
+            with contextlib.suppress(Exception):
+                pipeline.stop()
+            if not _stop_flag:
+                time.sleep(0.5)
 
 
 def get_frames() -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:

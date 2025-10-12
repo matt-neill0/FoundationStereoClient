@@ -80,11 +80,7 @@ def disparity_to_png16(disp: np.ndarray, max_disp: float, scale: float) -> bytes
     d = np.nan_to_num(disp, nan=0.0, posinf=max_disp, neginf=0.0)
     d = np.clip(d, 0.0, max_disp)
     scaled = np.round(d * scale)
-
-    if scaled.dtype not in (np.float32, np.float64):
-        scaled = scaled.astype(np.float32, copy=False)
-    scaled = np.clip(scaled, 0.0, np.float32(np.iinfo(np.uint16).max))
-    d16 = np.ascontiguousarray(scaled.astype(np.uint16))
+    d16 = np.ascontiguousarray(np.clip(scaled, 0.0, 65535).astype(np.uint16))
     ok, buf = cv2.imencode(".png", d16)
     if not ok:
         raise RuntimeError("cv2.imencode PNG failed")
@@ -177,7 +173,7 @@ class TensorRTPipeline:
         cuda.memcpy_dtoh_async(out_binding.host_mem, out_binding.device_mem, stream)
         stream.synchronize()
 
-        return np.array(out_binding.host_mem).squeeze()
+        return np.array(out_binding.host_mem, copy=True).squeeze()
 
 def _normalize_for_display(disp: np.ndarray) -> np.ndarray:
     disp_min, disp_max = float(np.min(disp)), float(np.max(disp))
@@ -200,7 +196,7 @@ class LocalEngineRunner:
             session_id: str,
             fps: float = DEFAULT_FPS,
             save_dir: Optional[Path] = None,
-            preview: bool = True,
+            preview: bool = False,
             max_disp: float = 256.0,
             disp_scale: float = 256.0,
             on_log: Optional[Callable[[str], None]] = None,
@@ -241,6 +237,8 @@ class LocalEngineRunner:
         self._capture_started = False
         self._use_realsense = self._determine_realsense_flag(use_realsense)
         self._save_dir_prepared = False
+        self._rs_fx_px: Optional[float] = None
+        self._rs_baseline_m: Optional[float] = None
         self._log_pose_configuration()
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
@@ -347,9 +345,8 @@ class LocalEngineRunner:
         if self._use_realsense:
             try:
                 fx_px, baseline_m = cam.get_calibration()
-                self._log(
-                    f"[local] RealSense calibration: fx={fx_px:.1f} baseline={baseline_m:.4f}m"
-                )
+                self._rs_fx_px, self._rs_baseline_m = fx_px, baseline_m
+                self._log(f"[local] RealSense calibration: fx={fx_px:.1f} baseline={baseline_m:.4f}m")
             except Exception as exc:
                 self._log(f"[local] Failed to fetch RealSense calibration: {exc}")
 
@@ -423,8 +420,13 @@ class LocalEngineRunner:
             "source_mode": self.mode,
             "sender_wh": [int(self.frame_width), int(self.frame_height)],
             "realsense": bool(self._use_realsense),
+            "disp_scale": float(self.disp_scale),
+            "max_disp": float(self.max_disp),
+            "pose": self._pose_metadata()
         }
-        meta["pose"] = self._pose_metadata()
+        if self._use_realsense and self._rs_fx_px is not None and self._rs_baseline_m is not None:
+            meta["fx_px"] = float(self._rs_fx_px)
+            meta["baseline_m"] = float(self._rs_baseline_m)
         self.on_result(
             seq,
             "disparity",
@@ -470,8 +472,6 @@ class LocalEngineRunner:
         return False
 
     def _respect_frame_rate(self, next_deadline: float, interval: float) -> float:
-        if interval <= 0.0:
-            return next_deadline
         next_deadline += interval
         sleep_s = next_deadline - time.perf_counter()
         if sleep_s > 0 and self._stop_event.wait(timeout=sleep_s):
