@@ -5,13 +5,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, List
 
 import cv2
 import numpy as np
 
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
-from pose_augmentation import get_pose_augmentation_info, get_pose_model_info
+from pose_augmentation import get_pose_augmentation_info, get_pose_model_info, depth_guided_nms, get_skeleton_edges
 
 try:
     import camera_capture as cam
@@ -240,6 +240,8 @@ class LocalEngineRunner:
         self._rs_fx_px: Optional[float] = None
         self._rs_baseline_m: Optional[float] = None
         self._log_pose_configuration()
+        self._pose_runner = None
+        self._last_pose_meta: List[Dict[str, Any]] = []
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
         if override is not None:
@@ -422,7 +424,8 @@ class LocalEngineRunner:
             "realsense": bool(self._use_realsense),
             "disp_scale": float(self.disp_scale),
             "max_disp": float(self.max_disp),
-            "pose": self._pose_metadata()
+            "pose": self._pose_metadata(),
+            "poses": getattr(self, "_last_pose_meta", [])
         }
         if self._use_realsense and self._rs_fx_px is not None and self._rs_baseline_m is not None:
             meta["fx_px"] = float(self._rs_fx_px)
@@ -505,6 +508,30 @@ class LocalEngineRunner:
                     disp = pipeline.infer(left_bgr, right_bgr)
                     fps = 1.0 / max(time.perf_counter() - start, 1e-6)
 
+                    # Pose estimation & depth-aware late fusion
+                    poses_uvc = []
+                    pose_scores = []
+                    if self.pose_enabled:
+                        if self._pose_runner is None:
+                            self._pose_runner = self._init_pose_backend()
+                        if self._pose_runner is not None:
+                            try:
+                                poses_uvc, pose_scores = self._pose_runner(left_bgr)
+                            except Exception as exc:
+                                self._log(f"[pose] backend failed: {exc}")
+                    aug_key = str(self.pose_augmentation or "").lower()
+                    if poses_uvc and aug_key in {"depth_postprocess", "depth_post", "post", ""}:
+                        depth_m = self._depth_from_disparity(disp)
+                        if depth_m is not None:
+                            edges = get_skeleton_edges(self.pose_model or "coco17")
+                            keep_idx = depth_guided_nms(poses_uvc, pose_scores, depth_m, edges, iou_threshold=0.5)
+                            poses_uvc = [poses_uvc[i] for i in keep_idx]
+                            pose_scores = [pose_scores[i] for i in keep_idx]
+                    pose_meta = []
+                    for kps, sc in zip(poses_uvc, pose_scores):
+                        pose_meta.append({"score": float(sc), "keypoints_uvc": np.asarray(kps, dtype=np.float32).tolist()})
+                    self._last_pose_meta = pose_meta
+
                     png16 = self._encode_disparity(disp)
                     self._emit_result(seq, png16)
                     self._save_result(seq, png16)
@@ -521,3 +548,75 @@ class LocalEngineRunner:
             finally:
                 self._cleanup_after_run()
                 self.on_finish()
+
+    def _init_pose_backend(self):
+        """Initialise a simple pose backend and return a callable(img_bgr)->(poses, scores)."""
+        backends = []
+
+        # MediaPipe BlazePose
+        try:
+            import mediapipe as mp  # type: ignore
+            mp_pose = mp.solutions.pose
+            pose = mp_pose.Pose(static_image_mode=False, model_complexity=1, enable_segmentation=False,
+                                min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+            def mp_runner(img_bgr: np.ndarray):
+                res = pose.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+                poses, scores = [], []
+                if res.pose_landmarks:
+                    lm = res.pose_landmarks.landmark
+                    h, w = img_bgr.shape[:2]
+                    sel = [0,11,12,13,14,15,16,23,24,25,26,27,28,5,2,7,8]
+                    kps = []
+                    for idx in sel:
+                        p = lm[idx]
+                        u, v = p.x * w, p.y * h
+                        c = float(p.visibility) if p.visibility is not None else 0.5
+                        kps.append([u, v, c])
+                    poses.append(np.array(kps, dtype=np.float32))
+                    scores.append(1.0)
+                return poses, scores
+
+            backends.append(mp_runner)
+            self._log("[pose] MediaPipe BlazePose backend initialised.")
+        except Exception:
+            self._log("[pose] MediaPipe not available; skipping BlazePose.")
+
+        # MoveNet ONNX via OpenCV DNN if selected
+        if self.pose_model and str(self.pose_model).lower().startswith("movenet"):
+            try:
+                onnx_path = "movenet_thunder.onnx"  # adjust path if needed
+                net = cv2.dnn.readNetFromONNX(onnx_path)
+
+                def movenet_runner(img_bgr: np.ndarray):
+                    inp = cv2.resize(img_bgr, (256, 256))
+                    blob = cv2.dnn.blobFromImage(inp, scalefactor=1/255.0, size=(256,256), swapRB=True, crop=False)
+                    net.setInput(blob)
+                    out = net.forward().reshape(-1, 3)
+                    h, w = img_bgr.shape[:2]
+                    kps = []
+                    for (y, x, c) in out:
+                        u = float(x) * w
+                        v = float(y) * h
+                        kps.append([u, v, float(c)])
+                    return [np.array(kps, dtype=np.float32)], [1.0]
+                backends.append(movenet_runner)
+                self._log("[pose] MoveNet-ONNX backend initialised.")
+            except Exception:
+                self._log("[pose] MoveNet ONNX not found/failed to load; skipping.")
+
+        if not backends:
+            return None
+        return backends[0]
+
+    def _depth_from_disparity(self, disparity: np.ndarray) -> Optional[np.ndarray]:
+        fx = self._rs_fx_px
+        bl = self._rs_baseline_m
+        if fx is None or bl is None:
+            return None
+        d = np.nan_to_num(disparity.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        eps = 1e-6
+        denom = np.maximum(d, eps)
+        depth = (fx * bl) / denom
+        depth[d <= eps] = np.nan
+        return depth

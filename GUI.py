@@ -25,6 +25,7 @@ from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
 
 VIDEO_FILE_FILTER = "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)"
 
+
 @dataclass(frozen=True)
 class SessionConfig:
     engine_path: str
@@ -42,11 +43,12 @@ class SessionConfig:
     pose_model: Optional[str] = None
     pose_augmentation: Optional[str] = None
 
+
 def _linux_list_cameras_v4l2() -> List[Tuple[int, str]]:
     try:
         proc = subprocess.run(
             ['v4l2-ctl', "--list-devices"],
-            check = True, text = True, capture_output = True
+            check=True, text=True, capture_output=True
         )
         text = proc.stdout
     except Exception:
@@ -72,8 +74,9 @@ def _linux_list_cameras_v4l2() -> List[Tuple[int, str]]:
                 if m:
                     idx = int(m.group(1))
                     mapping.append((idx, f"{header} ({dev})"))
-    mapping = sorted(set(mapping), key = lambda x: x[0])
+    mapping = sorted(set(mapping), key=lambda x: x[0])
     return mapping
+
 
 def _probe_indices_fallback(max_idx: int = 10) -> List[Tuple[int, str]]:
     out = []
@@ -88,6 +91,7 @@ def _probe_indices_fallback(max_idx: int = 10) -> List[Tuple[int, str]]:
             out.append((idx, name))
         cap.release()
     return out
+
 
 def list_cameras() -> List[Tuple[int, str]]:
     is_linux = (platform.system().lower() == "linux")
@@ -105,21 +109,21 @@ class LocalEngineWorker(QtCore.QThread):
     finish_signal = QtCore.Signal()
 
     def __init__(
-        self,
-        engine_path: str,
-        left_src: str,
-        right_src: str,
-        mode: str,
-        frame_width: int,
-        frame_height: int,
-        fps: float,
-        session_id: str,
-        save_dir: Optional[Path],
-        preview: bool,
-        use_realsense: bool,
-        pose_enabled: bool = False,
-        pose_model: Optional[str] = None,
-        pose_augmentation: Optional[str] = None,
+            self,
+            engine_path: str,
+            left_src: str,
+            right_src: str,
+            mode: str,
+            frame_width: int,
+            frame_height: int,
+            fps: float,
+            session_id: str,
+            save_dir: Optional[Path],
+            preview: bool,
+            use_realsense: bool,
+            pose_enabled: bool = False,
+            pose_model: Optional[str] = None,
+            pose_augmentation: Optional[str] = None,
     ):
         super().__init__()
         self._start_emitted = False
@@ -438,7 +442,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
         worker.log_signal.connect(self._log)
-        worker.result_signal.connect(self._on_result_image)
+        worker.result_signal.connect(lambda seq, kind, fmt, w, h, payload, meta: self._on_result_image(payload, meta))
         worker.start_signal.connect(self._handle_worker_started)
         worker.finish_signal.connect(self._handle_worker_finished)
 
@@ -502,7 +506,7 @@ class MainWindow(QtWidgets.QMainWindow):
         table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         table.horizontalHeader().setStretchLastSection(True)
 
-        for r, (idx, name) in enumerate(sorted(cams, key = lambda x: x[0])):
+        for r, (idx, name) in enumerate(sorted(cams, key=lambda x: x[0])):
             table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(idx)))
             table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(name)))
 
@@ -593,6 +597,41 @@ class MainWindow(QtWidgets.QMainWindow):
             disp = np.maximum(disp, 0.0)
         return disp
 
+    def _overlay_poses(self, vis_bgr: np.ndarray, meta_payload: dict) -> np.ndarray:
+        poses = (meta_payload or {}).get("poses") or []
+        if not poses:
+            return vis_bgr
+        # Edges for COCO-17-ish layouts
+        edges = [
+            (5, 7), (7, 9), (6, 8), (8, 10),
+            (11, 13), (13, 15), (12, 14), (14, 16),
+            (5, 6), (11, 12), (5, 11), (6, 12)
+        ]
+        out = vis_bgr.copy()
+        for p in poses:
+            kps = p.get("keypoints_uvc") or []
+            # draw joints
+            for pt in kps:
+                if len(pt) >= 3:
+                    u, v, c = pt
+                elif len(pt) == 2:
+                    u, v = pt;
+                    c = 1.0
+                else:
+                    continue
+                if c >= 0.2 and np.isfinite(u) and np.isfinite(v):
+                    cv2.circle(out, (int(round(u)), int(round(v))), 2, (0, 255, 0), -1)
+            # draw limbs
+            for a, b in edges:
+                if a < len(kps) and b < len(kps):
+                    ua, va, ca = kps[a] if len(kps[a]) >= 3 else (*kps[a], 1.0)
+                    ub, vb, cb = kps[b] if len(kps[b]) >= 3 else (*kps[b], 1.0)
+                    if min(ca, cb) >= 0.2 and all(np.isfinite(x) for x in (ua, va, ub, vb)):
+                        cv2.line(out, (int(round(ua)), int(round(va))), (int(round(ub)), int(round(vb))), (255, 200, 0),
+                                 2)
+        return out
+
+
     def _visualize_disparity(self, disparity: np.ndarray) -> np.ndarray:
         disp = np.nan_to_num(disparity.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         if self._disp_preview_max is not None:
@@ -674,13 +713,16 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             vis = self._visualize_disparity(disparity)
 
+        # Overlay poses if provided in meta
+        vis = self._overlay_poses(vis, meta_payload)
+
         if vis.ndim == 2:
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)
         else:
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
         hq, wq = vis_rgb.shape[:2]
         qimg = QtGui.QImage(vis_rgb.data, wq, hq, vis_rgb.strides[0], QtGui.QImage.Format.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+        pix = QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio,QtCore.Qt.TransformationMode.SmoothTransformation)
         self.preview_label.setPixmap(pix)
 
 def launch_gui():

@@ -713,6 +713,8 @@ class TwoStreamPoseBackbone(nn.Module):
 
 
 __all__ = [
+    "get_skeleton_edges",
+    "draw_skeletons",
     "PoseModelInfo",
     "PoseAugmentationInfo",
     "list_pose_models",
@@ -728,3 +730,46 @@ __all__ = [
     "FeatureFusion",
     "TwoStreamPoseBackbone",
 ]
+
+# ----------------------- Drawing / skeleton helpers (added) -----------------------
+
+COCO17_EDGES = [
+    (5, 7), (7, 9),      # left arm
+    (6, 8), (8, 10),     # right arm
+    (11, 13), (13, 15),  # left leg
+    (12, 14), (14, 16),  # right leg
+    (5, 6),              # shoulders
+    (11, 12),            # hips
+    (5, 11), (6, 12),    # torso diagonals
+]
+
+def get_skeleton_edges(model_key: str | None) -> list[tuple[int, int]]:
+    """Return edge list for a given pose model key.
+
+    For now we return a COCO-17 compatible edge set which works well for BlazePose/MoveNet
+    reduced 17-keypoint outputs. Extend this if you add BODY-25, etc.
+    """
+    return list(COCO17_EDGES)
+
+def draw_skeletons(
+    image_bgr: np.ndarray,
+    poses_uvc: list[np.ndarray],  # list of (K,3) [u,v,conf]
+    model_key: str | None,
+    conf_thresh: float = 0.2,
+) -> np.ndarray:
+    """Draw 2D skeletons on a BGR image and return a copy."""
+    out = image_bgr.copy()
+    edges = get_skeleton_edges(model_key)
+    for kp in poses_uvc:
+        # joints
+        for (u, v, c) in kp:
+            if c >= conf_thresh and np.isfinite(u) and np.isfinite(v):
+                cv2.circle(out, (int(round(u)), int(round(v))), 2, (0, 255, 0), -1)
+        # limbs
+        for a, b in edges:
+            if a < kp.shape[0] and b < kp.shape[0]:
+                ua, va, ca = kp[a]
+                ub, vb, cb = kp[b]
+                if min(ca, cb) >= conf_thresh and all(np.isfinite(x) for x in (ua, va, ub, vb)):
+                    cv2.line(out, (int(round(ua)), int(round(va))), (int(round(ub)), int(round(vb))), (255, 200, 0), 2)
+    return out
