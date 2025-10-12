@@ -20,7 +20,13 @@ from local_inference import (
     TensorRTUnavailableError,
     ensure_tensorrt_runtime,
 )
-from pose_augmentation import list_pose_augmentations, list_pose_models
+
+from pose_augmentation import (
+    draw_skeletons,
+    get_skeleton_edges,
+    list_pose_augmentations,
+    list_pose_models,
+)
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
 
 VIDEO_FILE_FILTER = "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)"
@@ -598,38 +604,65 @@ class MainWindow(QtWidgets.QMainWindow):
         return disp
 
     def _overlay_poses(self, vis_bgr: np.ndarray, meta_payload: dict) -> np.ndarray:
-        poses = (meta_payload or {}).get("poses") or []
+        payload = meta_payload or {}
+        poses = payload.get("poses") or []
         if not poses:
             return vis_bgr
         # Edges for COCO-17-ish layouts
-        edges = [
-            (5, 7), (7, 9), (6, 8), (8, 10),
-            (11, 13), (13, 15), (12, 14), (14, 16),
-            (5, 6), (11, 12), (5, 11), (6, 12)
-        ]
-        out = vis_bgr.copy()
-        for p in poses:
-            kps = p.get("keypoints_uvc") or []
-            # draw joints
-            for pt in kps:
-                if len(pt) >= 3:
-                    u, v, c = pt
-                elif len(pt) == 2:
-                    u, v = pt;
-                    c = 1.0
-                else:
-                    continue
-                if c >= 0.2 and np.isfinite(u) and np.isfinite(v):
-                    cv2.circle(out, (int(round(u)), int(round(v))), 2, (0, 255, 0), -1)
-            # draw limbs
-            for a, b in edges:
-                if a < len(kps) and b < len(kps):
-                    ua, va, ca = kps[a] if len(kps[a]) >= 3 else (*kps[a], 1.0)
-                    ub, vb, cb = kps[b] if len(kps[b]) >= 3 else (*kps[b], 1.0)
-                    if min(ca, cb) >= 0.2 and all(np.isfinite(x) for x in (ua, va, ub, vb)):
-                        cv2.line(out, (int(round(ua)), int(round(va))), (int(round(ub)), int(round(vb))), (255, 200, 0),
-                                 2)
-        return out
+        pose_meta = payload.get("pose") or {}
+        model_key = pose_meta.get("model")
+        if not model_key:
+            display_name = pose_meta.get("model_display")
+            if display_name:
+                for info in list_pose_models():
+                    if info.display_name == display_name:
+                        model_key = info.key
+                        break
+        if model_key:
+            model_key = str(model_key).lower()
+
+        # Convert pose dictionaries into numpy arrays compatible with draw_skeletons.
+        pose_arrays: List[np.ndarray] = []
+        for entry in poses:
+            kps = entry.get("keypoints_uvc") if isinstance(entry, dict) else None
+            if not kps:
+                continue
+            arr = np.asarray(kps, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[0] == 0:
+                continue
+            if arr.shape[1] == 2:
+                ones = np.ones((arr.shape[0], 1), dtype=np.float32)
+                arr = np.concatenate([arr, ones], axis=1)
+            elif arr.shape[1] > 3:
+                arr = arr[:, :3]
+            pose_arrays.append(arr)
+
+        if not pose_arrays:
+            return vis_bgr
+
+        try:
+            return draw_skeletons(vis_bgr, pose_arrays, model_key)
+        except Exception:
+            # Fall back to a simple COCO-17 style skeleton if specialised drawing fails.
+            edges = get_skeleton_edges(model_key)
+            out = vis_bgr.copy()
+            for arr in pose_arrays:
+                for (u, v, c) in arr:
+                    if c >= 0.2 and np.isfinite(u) and np.isfinite(v):
+                        cv2.circle(out, (int(round(u)), int(round(v))), 2, (0, 255, 0), -1)
+                for a, b in edges:
+                    if a < arr.shape[0] and b < arr.shape[0]:
+                        ua, va, ca = arr[a]
+                        ub, vb, cb = arr[b]
+                        if min(ca, cb) >= 0.2 and all(np.isfinite(x) for x in (ua, va, ub, vb)):
+                            cv2.line(
+                                out,
+                                (int(round(ua)), int(round(va))),
+                                (int(round(ub)), int(round(vb))),
+                                (255, 200, 0),
+                                2,
+                            )
+            return out
 
 
     def _visualize_disparity(self, disparity: np.ndarray) -> np.ndarray:
