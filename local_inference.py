@@ -11,8 +11,11 @@ import cv2
 import numpy as np
 
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
-from pose_augmentation import get_pose_augmentation_info, get_pose_model_info, depth_guided_nms, get_skeleton_edges
-
+from pose_augmentation import (
+    get_pose_model_info,
+    depth_guided_nms, get_skeleton_edges,
+    repair_occluded_joints, OcclusionRepairConfig
+)
 try:
     import camera_capture as cam
 except Exception as exc:  # pragma: no cover - during unit tests CameraCapture may not import
@@ -206,9 +209,10 @@ class LocalEngineRunner:
             on_start: Optional[Callable[[], None]] = None,
             on_finish: Optional[Callable[[], None]] = None,
             use_realsense: Optional[bool] = None,
+            fx_px: Optional[float] = None,
+            baseline_m: Optional[float] = None,
             pose_enabled: bool = False,
             pose_model: Optional[str] = None,
-            pose_augmentation: Optional[str] = None,
     ) -> None:
         if mode not in {"stream", "file"}:
             raise ValueError("mode must be either 'stream' or 'file'")
@@ -225,9 +229,10 @@ class LocalEngineRunner:
         self.preview = preview
         self.max_disp = max_disp
         self.disp_scale = disp_scale
+        self._manual_fx_px = fx_px
+        self._manual_baseline_m = baseline_m
         self.pose_enabled = bool(pose_enabled)
         self.pose_model = pose_model
-        self.pose_augmentation = pose_augmentation
         self.on_log = on_log or (lambda s: None)
         self.on_result = on_result or (lambda *args: None)
         self.on_start = on_start or (lambda: None)
@@ -274,15 +279,6 @@ class LocalEngineRunner:
             data["model_display"] = model_info.display_name
             data["model_description"] = model_info.description
 
-        aug_info = get_pose_augmentation_info(self.pose_augmentation)
-        if self.pose_augmentation is not None:
-            data["augmentation"] = self.pose_augmentation
-        if aug_info is not None:
-            data["augmentation_display"] = aug_info.display_name
-            data["augmentation_description"] = aug_info.description
-            if aug_info.components:
-                data["augmentation_components"] = list(aug_info.components)
-
         return data
 
     def _log_pose_configuration(self) -> None:
@@ -299,19 +295,6 @@ class LocalEngineRunner:
             self._log(f"[pose] Pose model '{self.pose_model}' is not recognised.")
         else:
             self._log("[pose] Pose estimation enabled without an explicit model key.")
-
-        aug_info = get_pose_augmentation_info(self.pose_augmentation)
-        if aug_info is not None:
-            self._log(
-                f"[pose] Augmentation: {aug_info.display_name} ({aug_info.key})."
-            )
-            if aug_info.components:
-                joined = ", ".join(aug_info.components)
-                self._log(f"[pose] Components: {joined}")
-        elif self.pose_augmentation:
-            self._log(
-                f"[pose] Augmentation key '{self.pose_augmentation}' is not recognised."
-            )
 
     def _prepare_engine(self) -> TensorRTPipeline:
         self._log(f"[local] Loading TensorRT engine: {self.engine_path}")
@@ -519,14 +502,29 @@ class LocalEngineRunner:
                                 poses_uvc, pose_scores = self._pose_runner(left_bgr)
                             except Exception as exc:
                                 self._log(f"[pose] backend failed: {exc}")
-                    aug_key = str(self.pose_augmentation or "").lower()
-                    if poses_uvc and aug_key in {"depth_postprocess", "depth_post", "post", ""}:
+                    if poses_uvc:
                         depth_m = self._depth_from_disparity(disp)
                         if depth_m is not None:
                             edges = get_skeleton_edges(self.pose_model or "coco17")
                             keep_idx = depth_guided_nms(poses_uvc, pose_scores, depth_m, edges, iou_threshold=0.5)
                             poses_uvc = [poses_uvc[i] for i in keep_idx]
                             pose_scores = [pose_scores[i] for i in keep_idx]
+
+                            repaired_poses = []
+                            for kp in poses_uvc:
+                                arr = np.asarray(kp, dtype=np.float32)
+                                uv = arr[:, :2]
+                                conf = arr[:, 2] if arr.shape[1] > 2 else np.ones((arr.shape[0],), dtype=np.float32)
+
+                                uv_fixed, conf_fixed = repair_occluded_joints(
+                                    uv, conf, depth_m, edges,
+                                    # OcclusionRepairConfig(confidence_threshold=0.2, search_radius=20.0, steps=10)
+                                )
+
+                                fixed = np.column_stack([uv_fixed, conf_fixed]).astype(np.float32)
+                                repaired_poses.append(fixed)
+
+                            poses_uvc = repaired_poses
                     pose_meta = []
                     for kps, sc in zip(poses_uvc, pose_scores):
                         pose_meta.append({"score": float(sc), "keypoints_uvc": np.asarray(kps, dtype=np.float32).tolist()})
@@ -566,7 +564,25 @@ class LocalEngineRunner:
                 if res.pose_landmarks:
                     lm = res.pose_landmarks.landmark
                     h, w = img_bgr.shape[:2]
-                    sel = [0,11,12,13,14,15,16,23,24,25,26,27,28,5,2,7,8]
+                    sel = [
+                        0,  # nose
+                        2,  # left_eye
+                        5,  # right_eye
+                        7,  # left_ear
+                        8,  # right_ear
+                        11,  # left_shoulder
+                        12,  # right_shoulder
+                        13,  # left_elbow
+                        14,  # right_elbow
+                        15,  # left_wrist
+                        16,  # right_wrist
+                        23,  # left_hip
+                        24,  # right_hip
+                        25,  # left_knee
+                        26,  # right_knee
+                        27,  # left_ankle
+                        28,  # right_ankle
+                    ]
                     kps = []
                     for idx in sel:
                         p = lm[idx]

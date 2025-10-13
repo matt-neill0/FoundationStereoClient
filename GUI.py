@@ -24,7 +24,6 @@ from local_inference import (
 from pose_augmentation import (
     draw_skeletons,
     get_skeleton_edges,
-    list_pose_augmentations,
     list_pose_models,
 )
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
@@ -47,7 +46,6 @@ class SessionConfig:
     use_realsense: bool
     pose_enabled: bool = False
     pose_model: Optional[str] = None
-    pose_augmentation: Optional[str] = None
 
 
 def _linux_list_cameras_v4l2() -> List[Tuple[int, str]]:
@@ -129,7 +127,6 @@ class LocalEngineWorker(QtCore.QThread):
             use_realsense: bool,
             pose_enabled: bool = False,
             pose_model: Optional[str] = None,
-            pose_augmentation: Optional[str] = None,
     ):
         super().__init__()
         self._start_emitted = False
@@ -163,7 +160,6 @@ class LocalEngineWorker(QtCore.QThread):
             use_realsense=use_realsense,
             pose_enabled=pose_enabled,
             pose_model=pose_model,
-            pose_augmentation=pose_augmentation,
         )
 
     def run(self):
@@ -227,17 +223,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pose_model_combo.addItem(info.display_name, info.key)
             idx = self.pose_model_combo.count() - 1
             self.pose_model_combo.setItemData(idx, info.description, QtCore.Qt.ItemDataRole.ToolTipRole)
-        self.pose_aug_label = QtWidgets.QLabel("Augmentation method")
-        self.pose_aug_combo = QtWidgets.QComboBox()
-        for info in list_pose_augmentations():
-            self.pose_aug_combo.addItem(info.display_name, info.key)
-            idx = self.pose_aug_combo.count() - 1
-            self.pose_aug_combo.setItemData(idx, info.description, QtCore.Qt.ItemDataRole.ToolTipRole)
         depth_layout.addWidget(self.pose_checkbox, 2, 0, 1, 2)
         depth_layout.addWidget(self.pose_model_label, 3, 0)
         depth_layout.addWidget(self.pose_model_combo, 3, 1)
-        depth_layout.addWidget(self.pose_aug_label, 4, 0)
-        depth_layout.addWidget(self.pose_aug_combo, 4, 1)
         depth_layout.setColumnStretch(1, 1)
 
         self.use_realsense = QtWidgets.QCheckBox("Use RealSense")
@@ -423,11 +411,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if pose_enabled
             else None
         )
-        pose_augmentation = (
-            self.pose_aug_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
-            if pose_enabled
-            else None
-        )
 
         return SessionConfig(
             engine_path=str(engine_path),
@@ -443,7 +426,6 @@ class MainWindow(QtWidgets.QMainWindow):
             use_realsense=use_realsense,
             pose_enabled=pose_enabled,
             pose_model=pose_model,
-            pose_augmentation=pose_augmentation
         )
 
     def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
@@ -491,7 +473,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pose_checkbox.setEnabled(is_depth)
         self.pose_checkbox.setVisible(is_depth)
         pose_controls_visible = is_depth and self.pose_checkbox.isChecked()
-        for w in [self.pose_model_label, self.pose_model_combo, self.pose_aug_label, self.pose_aug_combo]:
+        for w in [self.pose_model_label, self.pose_model_combo]:
             w.setVisible(pose_controls_visible)
             w.setEnabled(pose_controls_visible)
 

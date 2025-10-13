@@ -46,16 +46,6 @@ class PoseModelInfo:
     description: str
 
 
-@dataclass(frozen=True)
-class PoseAugmentationInfo:
-    """Metadata describing a depth-aware augmentation strategy."""
-
-    key: str
-    display_name: str
-    description: str
-    components: Tuple[str, ...] = ()
-
-
 _POSE_MODELS: Tuple[PoseModelInfo, ...] = (
     PoseModelInfo(
         key="openpose",
@@ -84,62 +74,12 @@ _POSE_MODELS: Tuple[PoseModelInfo, ...] = (
 )
 
 
-_POSE_AUGMENTATIONS: Tuple[PoseAugmentationInfo, ...] = (
-    PoseAugmentationInfo(
-        key="depth_postprocess",
-        display_name="Depth-aware post-processing",
-        description=(
-            "Lift 2D keypoints into 3D, apply depth-guided pose NMS and repair "
-            "occluded joints by searching along limbs at consistent depth."
-        ),
-        components=(
-            "lift_keypoints_to_3d",
-            "depth_guided_nms",
-            "repair_occluded_joints",
-        ),
-    ),
-    PoseAugmentationInfo(
-        key="early_fusion",
-        display_name="Early RGB-D fusion",
-        description=(
-            "Adapt RGB backbones to accept depth (or HHA) as an extra channel and "
-            "fine-tune for scale-aware feature learning."
-        ),
-        components=(
-            "adapt_first_conv_for_depth",
-            "convert_depth_to_hha",
-        ),
-    ),
-    PoseAugmentationInfo(
-        key="two_stream",
-        display_name="Two-stream fusion",
-        description=(
-            "Run dedicated RGB and depth encoders whose intermediate features are "
-            "fused (concat or attention) before the pose head."
-        ),
-        components=(
-            "FeatureFusion",
-            "TwoStreamPoseBackbone",
-        ),
-    ),
-)
-
-
 _POSE_MODELS_BY_KEY = {info.key: info for info in _POSE_MODELS}
-_POSE_AUGMENTATIONS_BY_KEY = {info.key: info for info in _POSE_AUGMENTATIONS}
-
 
 def list_pose_models() -> List[PoseModelInfo]:
     """Return the supported pose estimators."""
 
     return list(_POSE_MODELS)
-
-
-def list_pose_augmentations() -> List[PoseAugmentationInfo]:
-    """Return the supported depth-aware augmentation strategies."""
-
-    return list(_POSE_AUGMENTATIONS)
-
 
 def get_pose_model_info(key: Optional[str]) -> Optional[PoseModelInfo]:
     """Retrieve :class:`PoseModelInfo` for ``key`` (case insensitive)."""
@@ -147,14 +87,6 @@ def get_pose_model_info(key: Optional[str]) -> Optional[PoseModelInfo]:
     if key is None:
         return None
     return _POSE_MODELS_BY_KEY.get(str(key).lower())
-
-
-def get_pose_augmentation_info(key: Optional[str]) -> Optional[PoseAugmentationInfo]:
-    """Retrieve :class:`PoseAugmentationInfo` for ``key`` (case insensitive)."""
-
-    if key is None:
-        return None
-    return _POSE_AUGMENTATIONS_BY_KEY.get(str(key).lower())
 
 
 # ---------------------------------------------------------------------------
@@ -518,229 +450,34 @@ def repair_occluded_joints(
     return pose, confidences
 
 
-# ---------------------------------------------------------------------------
-# Early fusion helpers
-# ---------------------------------------------------------------------------
-
-
-def adapt_first_conv_for_depth(
-    backbone: nn.Module,
-    attr_name: str = "conv1",
-    depth_channels: int = 1,
-    init_strategy: str = "mean",
-) -> nn.Module:
-    """Adapt the first convolution of a backbone to ingest depth data.
-
-    Parameters
-    ----------
-    backbone:
-        Model whose attribute ``attr_name`` points to the first convolutional
-        layer.  The function modifies the model in-place and also returns it for
-        convenience.
-    attr_name:
-        Name of the attribute that stores the initial convolution.
-    depth_channels:
-        Number of additional depth channels.  ``1`` corresponds to concatenating
-        raw depth, ``3`` can be used for HHA encoded depth.
-    init_strategy:
-        Either ``"mean"`` (default) or ``"zeros"``.  ``"mean"`` clones the RGB
-        weights and initialises the additional depth filters with their mean.
-        ``"zeros"`` keeps the new kernel at zero while copying the RGB weights.
-
-    Returns
-    -------
-    nn.Module
-        The modified backbone.
-    """
-
-    if depth_channels < 1:
-        raise ValueError("depth_channels must be >= 1")
-
-    old_conv = getattr(backbone, attr_name, None)
-    if not isinstance(old_conv, nn.Conv2d):
-        raise AttributeError(f"{attr_name} must be an instance of nn.Conv2d")
-
-    new_in_channels = old_conv.in_channels + depth_channels
-    new_conv = nn.Conv2d(
-        in_channels=new_in_channels,
-        out_channels=old_conv.out_channels,
-        kernel_size=old_conv.kernel_size,
-        stride=old_conv.stride,
-        padding=old_conv.padding,
-        dilation=old_conv.dilation,
-        groups=old_conv.groups,
-        bias=old_conv.bias is not None,
-        padding_mode=old_conv.padding_mode,
-    )
-
-    with torch.no_grad():
-        new_conv.weight[:, : old_conv.in_channels] = old_conv.weight
-        if init_strategy == "mean":
-            depth_weight = old_conv.weight.mean(dim=1, keepdim=True)
-        elif init_strategy == "zeros":
-            depth_weight = torch.zeros_like(old_conv.weight[:, :1])
-        else:
-            raise ValueError("init_strategy must be either 'mean' or 'zeros'")
-
-        depth_weight = depth_weight.repeat(1, depth_channels, 1, 1)
-        new_conv.weight[:, old_conv.in_channels :] = depth_weight
-        if old_conv.bias is not None:
-            new_conv.bias.copy_(old_conv.bias)
-
-    setattr(backbone, attr_name, new_conv)
-    return backbone
-
-
-def convert_depth_to_hha(
-    depth_map: np.ndarray,
-    fx: float,
-    fy: float,
-    baseline: float = 1.0,
-    max_depth: float = 10.0,
-    invalid_value: float = 0.0,
-) -> np.ndarray:
-    """Convert a raw depth map to HHA (Horizontal disparity, Height, Angle).
-
-    The implementation follows Gupta et al., ECCV 2014.  The HHA representation
-    often yields better results than raw depth when used as input to CNNs.
-    ``fx`` and ``fy`` are the focal lengths of the camera (in pixels) and the
-    ``baseline`` is the stereo baseline used to compute disparity.
-    """
-
-    depth = np.asarray(depth_map, dtype=np.float32)
-    h, w = depth.shape
-
-    # Horizontal disparity (scaled inverse depth)
-    disparity = np.where(depth > 0, baseline * fx / np.clip(depth, 1e-6, max_depth), 0)
-
-    # Height above ground plane approximation: assume gravity is aligned with
-    # the negative Y-axis of the camera coordinate system.
-    grid_y, grid_x = np.mgrid[0:h, 0:w]
-    z = depth
-    x = (grid_x - w / 2.0) * z / fx
-    y = (grid_y - h / 2.0) * z / fy
-    height = -y  # camera Y-axis typically points downwards
-
-    # Angle with inferred gravity vector.  Approximate surface normals via
-    # central differences in 3D space.
-    dzdx = np.gradient(z, axis=1)
-    dzdy = np.gradient(z, axis=0)
-    nx = -dzdx
-    ny = -dzdy
-    nz = np.ones_like(z)
-    norm = np.sqrt(nx ** 2 + ny ** 2 + nz ** 2) + 1e-8
-    nx /= norm
-    ny /= norm
-    nz /= norm
-    angle = np.degrees(np.arccos(np.clip(ny, -1.0, 1.0)))
-
-    hha = np.stack([disparity, height, angle], axis=-1)
-    hha[~np.isfinite(hha)] = invalid_value
-    return hha
-
-
-# ---------------------------------------------------------------------------
-# Mid / late fusion helpers
-# ---------------------------------------------------------------------------
-
-
-class FeatureFusion(nn.Module):
-    """Fuse RGB and depth feature maps using concatenation or attention."""
-
-    def __init__(self, in_channels: int, fusion_channels: int, mode: str = "concat") -> None:
-        super().__init__()
-        self.mode = mode
-        if mode == "concat":
-            self.fuse = nn.Sequential(
-                nn.Conv2d(in_channels * 2, fusion_channels, kernel_size=1),
-                nn.BatchNorm2d(fusion_channels),
-                nn.ReLU(inplace=True),
-            )
-        elif mode == "attention":
-            self.key = nn.Conv2d(in_channels, fusion_channels, kernel_size=1)
-            self.query = nn.Conv2d(in_channels, fusion_channels, kernel_size=1)
-            self.value = nn.Conv2d(in_channels, fusion_channels, kernel_size=1)
-            self.out_proj = nn.Conv2d(fusion_channels, fusion_channels, kernel_size=1)
-        else:
-            raise ValueError("mode must be either 'concat' or 'attention'")
-
-    def forward(self, rgb_feat: Tensor, depth_feat: Tensor) -> Tensor:
-        if self.mode == "concat":
-            fused = torch.cat([rgb_feat, depth_feat], dim=1)
-            return self.fuse(fused)
-
-        # Attention mode: compute simple multiplicative attention map.
-        q = self.query(rgb_feat)
-        k = self.key(depth_feat)
-        v = self.value(depth_feat)
-        attn = torch.sigmoid(q * k)
-        fused = self.out_proj(attn * v + rgb_feat)
-        return fused
-
-
-class TwoStreamPoseBackbone(nn.Module):
-    """Combine two backbones (RGB and depth) with feature fusion layers.
-
-    The module expects the caller to pass feature extractor callables that return
-    intermediate feature maps (e.g. the C3/C4 features of a ResNet).  Only the
-    fusion logic is implemented here to keep the component generic.
-    """
-
-    def __init__(
-        self,
-        rgb_backbone: Callable[[Tensor], Sequence[Tensor]],
-        depth_backbone: Callable[[Tensor], Sequence[Tensor]],
-        fusion_modules: Sequence[nn.Module],
-    ) -> None:
-        super().__init__()
-        self.rgb_backbone = rgb_backbone
-        self.depth_backbone = depth_backbone
-        self.fusion_modules = nn.ModuleList(fusion_modules)
-
-        if len(self.fusion_modules) == 0:
-            raise ValueError("At least one fusion module must be provided")
-
-    def forward(self, rgb: Tensor, depth: Tensor) -> List[Tensor]:
-        rgb_feats = self.rgb_backbone(rgb)
-        depth_feats = self.depth_backbone(depth)
-        if len(rgb_feats) != len(depth_feats) or len(rgb_feats) != len(self.fusion_modules):
-            raise ValueError("Number of feature levels must match the fusion modules")
-
-        fused: List[Tensor] = []
-        for rgb_feat, depth_feat, fuse in zip(rgb_feats, depth_feats, self.fusion_modules):
-            fused.append(fuse(rgb_feat, depth_feat))
-        return fused
-
 
 __all__ = [
     "get_skeleton_edges",
     "draw_skeletons",
     "PoseModelInfo",
-    "PoseAugmentationInfo",
     "list_pose_models",
-    "list_pose_augmentations",
     "get_pose_model_info",
-    "get_pose_augmentation_info",
     "lift_keypoints_to_3d",
     "depth_guided_nms",
     "repair_occluded_joints",
     "OcclusionRepairConfig",
-    "adapt_first_conv_for_depth",
-    "convert_depth_to_hha",
-    "FeatureFusion",
-    "TwoStreamPoseBackbone",
 ]
 
 # ----------------------- Drawing / skeleton helpers (added) -----------------------
 
 COCO17_EDGES = [
-    (5, 7), (7, 9),      # left arm
-    (6, 8), (8, 10),     # right arm
-    (11, 13), (13, 15),  # left leg
-    (12, 14), (14, 16),  # right leg
-    (5, 6),              # shoulders
-    (11, 12),            # hips
-    (5, 11), (6, 12),    # torso diagonals
+    # Head
+    (0, 1), (0, 2),
+    (1, 3), (2, 4),
+    # Torso/shoulders
+    (0, 5), (0, 6), (5, 6),
+    (5, 11), (6, 12), (11, 12),
+    # Arms
+    (5, 7), (7, 9),
+    (6, 8), (8, 10),
+    # Legs
+    (11, 13), (13, 15),
+    (12, 14), (14, 16),
 ]
 
 def get_skeleton_edges(model_key: str | None) -> list[tuple[int, int]]:
