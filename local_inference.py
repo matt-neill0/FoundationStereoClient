@@ -5,14 +5,14 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, List
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, List, Sequence
 
 import cv2
 import numpy as np
 
 from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
 from pose_augmentation import (
-    get_pose_model_info,
+    get_pose_model_info, lift_keypoints_to_3d,
     depth_guided_nms, get_skeleton_edges,
     repair_occluded_joints, OcclusionRepairConfig
 )
@@ -464,6 +464,83 @@ class LocalEngineRunner:
             return next_deadline
         return next_deadline
 
+    def _compose_rgbd_input(
+            self, image_bgr: np.ndarray, depth_m: Optional[np.ndarray]
+    ) -> np.ndarray:
+        """Blend a depth map into the RGB frame to create an RGB-D input."""
+
+        if depth_m is None:
+            return image_bgr
+
+        depth = np.asarray(depth_m, dtype=np.float32)
+        if depth.shape[:2] != image_bgr.shape[:2]:
+            depth = cv2.resize(depth, (image_bgr.shape[1], image_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        valid = np.isfinite(depth) & (depth > 0)
+        if not np.any(valid):
+            return image_bgr
+
+        depth_valid = depth[valid]
+        d_min = float(np.percentile(depth_valid, 5.0))
+        d_max = float(np.percentile(depth_valid, 95.0))
+        if not np.isfinite(d_min) or not np.isfinite(d_max) or d_max <= d_min:
+            return image_bgr
+
+        depth_norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
+        depth_u8 = (depth_norm * 255.0).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_VIRIDIS)
+        fused = cv2.addWeighted(image_bgr, 0.65, depth_color, 0.35, 0.0)
+        return fused
+
+    def _depth_weighted_scores(
+            self,
+            poses: Sequence[np.ndarray],
+            scores: Sequence[float],
+            depth_m: Optional[np.ndarray],
+    ) -> List[float]:
+        """Adjust pose confidences based on valid depth coverage."""
+
+        if depth_m is None:
+            return [float(s) for s in scores]
+
+        h, w = depth_m.shape[:2]
+        adjusted: List[float] = []
+        for pose, score in zip(poses, scores):
+            pts = np.asarray(pose)
+            if pts.size == 0:
+                adjusted.append(float(score))
+                continue
+
+            valid = 0
+            considered = 0
+            for (u, v, *_rest) in pts:
+                ui = int(round(float(u)))
+                vi = int(round(float(v)))
+                if 0 <= ui < w and 0 <= vi < h:
+                    considered += 1
+                    depth_val = float(depth_m[vi, ui])
+                    if np.isfinite(depth_val) and depth_val > 0:
+                        valid += 1
+
+            if considered == 0:
+                adjusted.append(float(score) * 0.5)
+                continue
+
+            coverage = valid / considered
+            adjusted.append(float(score) * (0.5 + 0.5 * coverage))
+
+        return adjusted
+
+    def _current_pose_intrinsics(self) -> Optional[Tuple[float, float, float, float]]:
+        fx = self._rs_fx_px if self._rs_fx_px is not None else self._manual_fx_px
+        bl = self._rs_baseline_m if self._rs_baseline_m is not None else self._manual_baseline_m
+        if fx is None or bl is None:
+            return None
+        fy = fx
+        cx = self.frame_width / 2.0
+        cy = self.frame_height / 2.0
+        return float(fx), float(fy), float(cx), float(cy)
+
     def _stop_capture_threads(self) -> None:
         if self._capture_started and cam is not None:
             cam.signal_stop()
@@ -491,43 +568,67 @@ class LocalEngineRunner:
                     disp = pipeline.infer(left_bgr, right_bgr)
                     fps = 1.0 / max(time.perf_counter() - start, 1e-6)
 
+                    depth_m = self._depth_from_disparity(disp)
+
                     # Pose estimation & depth-aware late fusion
-                    poses_uvc = []
-                    pose_scores = []
+                    poses_uvc: List[np.ndarray] = []
+                    pose_scores: List[float] = []
                     if self.pose_enabled:
                         if self._pose_runner is None:
                             self._pose_runner = self._init_pose_backend()
                         if self._pose_runner is not None:
                             try:
-                                poses_uvc, pose_scores = self._pose_runner(left_bgr)
+                                poses_uvc, pose_scores = self._pose_runner(left_bgr, depth_m)
                             except Exception as exc:
                                 self._log(f"[pose] backend failed: {exc}")
-                    if poses_uvc:
-                        depth_m = self._depth_from_disparity(disp)
-                        if depth_m is not None:
-                            edges = get_skeleton_edges(self.pose_model or "coco17")
-                            keep_idx = depth_guided_nms(poses_uvc, pose_scores, depth_m, edges, iou_threshold=0.5)
-                            poses_uvc = [poses_uvc[i] for i in keep_idx]
-                            pose_scores = [pose_scores[i] for i in keep_idx]
+                    if poses_uvc and depth_m is not None:
+                        edges = get_skeleton_edges(self.pose_model or "coco17")
+                        keep_idx = depth_guided_nms(
+                            poses_uvc, pose_scores, depth_m, edges, iou_threshold=0.5
+                        )
+                        poses_uvc = [poses_uvc[i] for i in keep_idx]
+                        pose_scores = [pose_scores[i] for i in keep_idx]
 
-                            repaired_poses = []
-                            for kp in poses_uvc:
-                                arr = np.asarray(kp, dtype=np.float32)
-                                uv = arr[:, :2]
-                                conf = arr[:, 2] if arr.shape[1] > 2 else np.ones((arr.shape[0],), dtype=np.float32)
+                        repaired_poses = []
+                        for kp in poses_uvc:
+                            arr = np.asarray(kp, dtype=np.float32)
+                            uv = arr[:, :2]
+                            conf = (
+                                arr[:, 2]
+                                if arr.shape[1] > 2
+                                else np.ones((arr.shape[0],), dtype=np.float32)
+                            )
 
-                                uv_fixed, conf_fixed = repair_occluded_joints(
-                                    uv, conf, depth_m, edges,
-                                    # OcclusionRepairConfig(confidence_threshold=0.2, search_radius=20.0, steps=10)
-                                )
+                            uv_fixed, conf_fixed = repair_occluded_joints(
+                                uv,
+                                conf,
+                                depth_m,
+                                edges,
+                                # OcclusionRepairConfig(confidence_threshold=0.2, search_radius=20.0, steps=10)
+                            )
 
-                                fixed = np.column_stack([uv_fixed, conf_fixed]).astype(np.float32)
-                                repaired_poses.append(fixed)
+                            fixed = np.column_stack([uv_fixed, conf_fixed]).astype(np.float32)
+                            repaired_poses.append(fixed)
 
-                            poses_uvc = repaired_poses
-                    pose_meta = []
+                        poses_uvc = repaired_poses
+
+                    pose_meta: List[Dict[str, Any]] = []
+                    intrinsics = (
+                        self._current_pose_intrinsics() if depth_m is not None else None
+                    )
                     for kps, sc in zip(poses_uvc, pose_scores):
-                        pose_meta.append({"score": float(sc), "keypoints_uvc": np.asarray(kps, dtype=np.float32).tolist()})
+                        entry: Dict[str, Any] = {
+                            "score": float(sc),
+                            "keypoints_uvc": np.asarray(kps, dtype=np.float32).tolist(),
+                        }
+                        if intrinsics is not None and depth_m is not None:
+                            xyz = lift_keypoints_to_3d(
+                                np.asarray(kps, dtype=np.float32)[:, :2],
+                                depth_m,
+                                intrinsics,
+                            )
+                            entry["keypoints_xyz"] = np.asarray(xyz, dtype=np.float32).tolist()
+                        pose_meta.append(entry)
                     self._last_pose_meta = pose_meta
 
                     png16 = self._encode_disparity(disp)
@@ -548,7 +649,7 @@ class LocalEngineRunner:
                 self.on_finish()
 
     def _init_pose_backend(self):
-        """Initialise a simple pose backend and return a callable(img_bgr)->(poses, scores)."""
+        """Initialise a simple RGB-D aware pose backend."""
         backends = []
 
         # MediaPipe BlazePose
@@ -558,12 +659,13 @@ class LocalEngineRunner:
             pose = mp_pose.Pose(static_image_mode=False, model_complexity=1, enable_segmentation=False,
                                 min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-            def mp_runner(img_bgr: np.ndarray):
-                res = pose.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            def mp_runner(img_bgr: np.ndarray, depth: Optional[np.ndarray]):
+                fused = self._compose_rgbd_input(img_bgr, depth)
+                res = pose.process(cv2.cvtColor(fused, cv2.COLOR_BGR2RGB))
                 poses, scores = [], []
                 if res.pose_landmarks:
                     lm = res.pose_landmarks.landmark
-                    h, w = img_bgr.shape[:2]
+                    h, w = fused.shape[:2]
                     sel = [
                         0,  # nose
                         2,  # left_eye
@@ -591,6 +693,7 @@ class LocalEngineRunner:
                         kps.append([u, v, c])
                     poses.append(np.array(kps, dtype=np.float32))
                     scores.append(1.0)
+                scores = self._depth_weighted_scores(poses, scores, depth)
                 return poses, scores
 
             backends.append(mp_runner)
@@ -604,18 +707,21 @@ class LocalEngineRunner:
                 onnx_path = "movenet_thunder.onnx"  # adjust path if needed
                 net = cv2.dnn.readNetFromONNX(onnx_path)
 
-                def movenet_runner(img_bgr: np.ndarray):
-                    inp = cv2.resize(img_bgr, (256, 256))
+                def movenet_runner(img_bgr: np.ndarray, depth: Optional[np.ndarray]):
+                    fused = self._compose_rgbd_input(img_bgr, depth)
+                    inp = cv2.resize(fused, (256, 256))
                     blob = cv2.dnn.blobFromImage(inp, scalefactor=1/255.0, size=(256,256), swapRB=True, crop=False)
                     net.setInput(blob)
                     out = net.forward().reshape(-1, 3)
-                    h, w = img_bgr.shape[:2]
+                    h, w = fused.shape[:2]
                     kps = []
                     for (y, x, c) in out:
                         u = float(x) * w
                         v = float(y) * h
                         kps.append([u, v, float(c)])
-                    return [np.array(kps, dtype=np.float32)], [1.0]
+                    poses = [np.array(kps, dtype=np.float32)]
+                    scores = self._depth_weighted_scores(poses, [1.0], depth)
+                    return poses, scores
                 backends.append(movenet_runner)
                 self._log("[pose] MoveNet-ONNX backend initialised.")
             except Exception:
@@ -626,13 +732,15 @@ class LocalEngineRunner:
         return backends[0]
 
     def _depth_from_disparity(self, disparity: np.ndarray) -> Optional[np.ndarray]:
-        fx = self._rs_fx_px
-        bl = self._rs_baseline_m
+        fx = self._rs_fx_px if self._rs_fx_px is not None else self._manual_fx_px
+        bl = self._rs_baseline_m if self._rs_baseline_m is not None else self._manual_baseline_m
+
         if fx is None or bl is None:
             return None
-        d = np.nan_to_num(disparity.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        d = np.asarray(disparity, dtype=np.float32)
         eps = 1e-6
         denom = np.maximum(d, eps)
-        depth = (fx * bl) / denom
-        depth[d <= eps] = np.nan
+        depth = (float(fx) * float(bl)) / denom
+        invalid = ~np.isfinite(d) | (d <= eps)
+        depth[invalid] = np.nan
         return depth
