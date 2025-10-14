@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, List, Sequence
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -16,6 +16,7 @@ from pose_augmentation import (
     depth_guided_nms, get_skeleton_edges,
     repair_occluded_joints, OcclusionRepairConfig
 )
+from pose_backends import PoseBackend, build_pose_backend
 try:
     import camera_capture as cam
 except Exception as exc:  # pragma: no cover - during unit tests CameraCapture may not import
@@ -245,7 +246,10 @@ class LocalEngineRunner:
         self._rs_fx_px: Optional[float] = None
         self._rs_baseline_m: Optional[float] = None
         self._log_pose_configuration()
-        self._pose_runner = None
+        self._pose_runner: Optional[PoseBackend] = None
+        self._resolved_pose_key: Optional[str] = (
+            str(self.pose_model).lower() if self.pose_model else None
+        )
         self._last_pose_meta: List[Dict[str, Any]] = []
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
@@ -272,9 +276,12 @@ class LocalEngineRunner:
         if not self.pose_enabled:
             return data
 
-        model_info = get_pose_model_info(self.pose_model)
-        if self.pose_model is not None:
-            data["model"] = self.pose_model
+        model_key = self._resolved_pose_key or (
+            str(self.pose_model).lower() if self.pose_model else None
+        )
+        if model_key is not None:
+            data["model"] = model_key
+        model_info = get_pose_model_info(model_key)
         if model_info is not None:
             data["model_display"] = model_info.display_name
             data["model_description"] = model_info.description
@@ -464,73 +471,6 @@ class LocalEngineRunner:
             return next_deadline
         return next_deadline
 
-    def _compose_rgbd_input(
-            self, image_bgr: np.ndarray, depth_m: Optional[np.ndarray]
-    ) -> np.ndarray:
-        """Blend a depth map into the RGB frame to create an RGB-D input."""
-
-        if depth_m is None:
-            return image_bgr
-
-        depth = np.asarray(depth_m, dtype=np.float32)
-        if depth.shape[:2] != image_bgr.shape[:2]:
-            depth = cv2.resize(depth, (image_bgr.shape[1], image_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-        valid = np.isfinite(depth) & (depth > 0)
-        if not np.any(valid):
-            return image_bgr
-
-        depth_valid = depth[valid]
-        d_min = float(np.percentile(depth_valid, 5.0))
-        d_max = float(np.percentile(depth_valid, 95.0))
-        if not np.isfinite(d_min) or not np.isfinite(d_max) or d_max <= d_min:
-            return image_bgr
-
-        depth_norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
-        depth_u8 = (depth_norm * 255.0).astype(np.uint8)
-        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_VIRIDIS)
-        fused = cv2.addWeighted(image_bgr, 0.65, depth_color, 0.35, 0.0)
-        return fused
-
-    def _depth_weighted_scores(
-            self,
-            poses: Sequence[np.ndarray],
-            scores: Sequence[float],
-            depth_m: Optional[np.ndarray],
-    ) -> List[float]:
-        """Adjust pose confidences based on valid depth coverage."""
-
-        if depth_m is None:
-            return [float(s) for s in scores]
-
-        h, w = depth_m.shape[:2]
-        adjusted: List[float] = []
-        for pose, score in zip(poses, scores):
-            pts = np.asarray(pose)
-            if pts.size == 0:
-                adjusted.append(float(score))
-                continue
-
-            valid = 0
-            considered = 0
-            for (u, v, *_rest) in pts:
-                ui = int(round(float(u)))
-                vi = int(round(float(v)))
-                if 0 <= ui < w and 0 <= vi < h:
-                    considered += 1
-                    depth_val = float(depth_m[vi, ui])
-                    if np.isfinite(depth_val) and depth_val > 0:
-                        valid += 1
-
-            if considered == 0:
-                adjusted.append(float(score) * 0.5)
-                continue
-
-            coverage = valid / considered
-            adjusted.append(float(score) * (0.5 + 0.5 * coverage))
-
-        return adjusted
-
     def _current_pose_intrinsics(self) -> Optional[Tuple[float, float, float, float]]:
         fx = self._rs_fx_px if self._rs_fx_px is not None else self._manual_fx_px
         bl = self._rs_baseline_m if self._rs_baseline_m is not None else self._manual_baseline_m
@@ -648,88 +588,28 @@ class LocalEngineRunner:
                 self._cleanup_after_run()
                 self.on_finish()
 
-    def _init_pose_backend(self):
-        """Initialise a simple RGB-D aware pose backend."""
-        backends = []
-
-        # MediaPipe BlazePose
+    def _init_pose_backend(self) -> Optional[PoseBackend]:
+        """Initialise the configured RGB-D aware pose backend."""
         try:
-            import mediapipe as mp  # type: ignore
-            mp_pose = mp.solutions.pose
-            pose = mp_pose.Pose(static_image_mode=False, model_complexity=1, enable_segmentation=False,
-                                min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
-            def mp_runner(img_bgr: np.ndarray, depth: Optional[np.ndarray]):
-                fused = self._compose_rgbd_input(img_bgr, depth)
-                res = pose.process(cv2.cvtColor(fused, cv2.COLOR_BGR2RGB))
-                poses, scores = [], []
-                if res.pose_landmarks:
-                    lm = res.pose_landmarks.landmark
-                    h, w = fused.shape[:2]
-                    sel = [
-                        0,  # nose
-                        2,  # left_eye
-                        5,  # right_eye
-                        7,  # left_ear
-                        8,  # right_ear
-                        11,  # left_shoulder
-                        12,  # right_shoulder
-                        13,  # left_elbow
-                        14,  # right_elbow
-                        15,  # left_wrist
-                        16,  # right_wrist
-                        23,  # left_hip
-                        24,  # right_hip
-                        25,  # left_knee
-                        26,  # right_knee
-                        27,  # left_ankle
-                        28,  # right_ankle
-                    ]
-                    kps = []
-                    for idx in sel:
-                        p = lm[idx]
-                        u, v = p.x * w, p.y * h
-                        c = float(p.visibility) if p.visibility is not None else 0.5
-                        kps.append([u, v, c])
-                    poses.append(np.array(kps, dtype=np.float32))
-                    scores.append(1.0)
-                scores = self._depth_weighted_scores(poses, scores, depth)
-                return poses, scores
-
-            backends.append(mp_runner)
-            self._log("[pose] MediaPipe BlazePose backend initialised.")
-        except Exception:
-            self._log("[pose] MediaPipe not available; skipping BlazePose.")
-
-        # MoveNet ONNX via OpenCV DNN if selected
-        if self.pose_model and str(self.pose_model).lower().startswith("movenet"):
-            try:
-                onnx_path = "movenet_thunder.onnx"  # adjust path if needed
-                net = cv2.dnn.readNetFromONNX(onnx_path)
-
-                def movenet_runner(img_bgr: np.ndarray, depth: Optional[np.ndarray]):
-                    fused = self._compose_rgbd_input(img_bgr, depth)
-                    inp = cv2.resize(fused, (256, 256))
-                    blob = cv2.dnn.blobFromImage(inp, scalefactor=1/255.0, size=(256,256), swapRB=True, crop=False)
-                    net.setInput(blob)
-                    out = net.forward().reshape(-1, 3)
-                    h, w = fused.shape[:2]
-                    kps = []
-                    for (y, x, c) in out:
-                        u = float(x) * w
-                        v = float(y) * h
-                        kps.append([u, v, float(c)])
-                    poses = [np.array(kps, dtype=np.float32)]
-                    scores = self._depth_weighted_scores(poses, [1.0], depth)
-                    return poses, scores
-                backends.append(movenet_runner)
-                self._log("[pose] MoveNet-ONNX backend initialised.")
-            except Exception:
-                self._log("[pose] MoveNet ONNX not found/failed to load; skipping.")
-
-        if not backends:
+            backend, resolved_key = build_pose_backend(self.pose_model, self._log)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self._log(f"[pose] Failed to initialise pose backend: {exc}")
             return None
-        return backends[0]
+        if backend is None:
+            self._log("[pose] No pose backend could be initialised.")
+            return None
+
+        self._pose_runner = backend
+        self._resolved_pose_key = resolved_key
+
+        if resolved_key is not None:
+            info = get_pose_model_info(resolved_key)
+            if info is not None:
+                self._log(f"[pose] {info.display_name} backend ready ({info.key}).")
+            else:
+                self._log(f"[pose] Pose backend ready for key '{resolved_key}'.")
+
+        return backend
 
     def _depth_from_disparity(self, disparity: np.ndarray) -> Optional[np.ndarray]:
         fx = self._rs_fx_px if self._rs_fx_px is not None else self._manual_fx_px

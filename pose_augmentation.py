@@ -55,20 +55,39 @@ _POSE_MODELS: Tuple[PoseModelInfo, ...] = (
             "Depth cues can be used for late fusion to improve skeleton selection."
         ),
     ),
+
+    # ↓ Split MoveNet into two variants
     PoseModelInfo(
-        key="movenet",
-        display_name="MoveNet",
+        key="movenet_lightning",
+        display_name="MoveNet Lightning (192×192)",
         description=(
-            "Lightweight single-person model from Google. Ideal for edge devices and "
-            "real-time inference when combined with depth-aware post-processing."
+            "Fastest MoveNet variant. Great for real-time, lower-latency demos; "
+            "combine with depth-aware post-processing for stability."
         ),
     ),
+    PoseModelInfo(
+        key="movenet_thunder",
+        display_name="MoveNet Thunder (256×256)",
+        description=(
+            "Higher-accuracy MoveNet variant with a larger input; "
+            "pairs well with depth-guided NMS and 3D lifting."
+        ),
+    ),
+
     PoseModelInfo(
         key="blazepose",
         display_name="BlazePose",
         description=(
             "MediaPipe full-body pose network well suited for fitness and AR "
             "applications. Responds well to early fusion with RGB-D inputs."
+        ),
+    ),
+    PoseModelInfo(
+        key="holistic",
+        display_name="MediaPipe Holistic",
+        description=(
+            "MediaPipe Holistic body estimator covering body, face, and hands. "
+            "RGB-D fusion strengthens landmark stability in challenging lighting."
         ),
     ),
 )
@@ -299,7 +318,6 @@ def depth_guided_nms(
                 keep.pop()  # remove the current pose
                 keep.append(idx)
                 current = idx
-                consistency_current = consistency_other
             # Suppress the other pose regardless of which one won.
         order = remaining
 
