@@ -197,6 +197,84 @@ def _resolve_movenet_model(model_key: str) -> Tuple[str, int]:
 
 def _build_movenet_backend(log: Callable[[str], None], key: str) -> Optional[PoseBackend]:
     onnx_path, input_size = _resolve_movenet_model(key)
+
+    # Prefer ONNX Runtime when available because it supports a wider range of
+    # ONNX operators (e.g. GatherND which is used by the official MoveNet
+    # export) than OpenCV's DNN module.  Falling back to OpenCV keeps the
+    # dependency optional for environments where installing onnxruntime is not
+    # possible.
+    ort_session = None
+    ort_input_name: Optional[str] = None
+    ort_output_name: Optional[str] = None
+    try:  # pragma: no cover - optional dependency
+        import onnxruntime as ort  # type: ignore
+
+        providers = ort.get_available_providers()
+        ort_session = ort.InferenceSession(onnx_path, providers=providers)
+        ort_input_name = ort_session.get_inputs()[0].name
+        ort_output_name = ort_session.get_outputs()[0].name
+        log(f"[pose] MoveNet backend initialised via ONNX Runtime from '{onnx_path}'.")
+    except ImportError:
+        log("[pose] onnxruntime not available; falling back to OpenCV DNN for MoveNet.")
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log(
+            "[pose] Failed to initialise MoveNet with onnxruntime; "
+            f"falling back to OpenCV DNN ({exc})."
+        )
+        ort_session = None
+        ort_input_name = None
+        ort_output_name = None
+
+    if ort_session is not None and ort_input_name and ort_output_name:
+        input_meta = ort_session.get_inputs()[0]
+        input_type = input_meta.type
+
+        _ORT_TYPE_TO_DTYPE = {
+            "tensor(float)": np.float32,
+            "tensor(float16)": np.float16,
+            "tensor(double)": np.float64,
+            "tensor(uint8)": np.uint8,
+            "tensor(int8)": np.int8,
+            "tensor(int16)": np.int16,
+            "tensor(int32)": np.int32,
+            "tensor(int64)": np.int64,
+        }
+        ort_input_dtype = _ORT_TYPE_TO_DTYPE.get(input_type)
+        if ort_input_dtype is None:
+            log(
+                "[pose] MoveNet ONNX input type '%s' not explicitly handled; "
+                "defaulting to float32 normalised input." % input_type
+            )
+            ort_input_dtype = np.float32
+
+        def _prepare_ort_input(rgb: np.ndarray) -> np.ndarray:
+            if ort_input_dtype == np.float16:
+                arr = (rgb.astype(np.float32) / 255.0).astype(np.float16)
+            elif np.issubdtype(ort_input_dtype, np.floating):
+                arr = rgb.astype(ort_input_dtype) / 255.0
+            else:
+                arr = rgb.astype(ort_input_dtype)
+            return np.expand_dims(arr, axis=0)
+
+        def runner(img_bgr: np.ndarray, depth: Optional[np.ndarray]):
+            fused = compose_rgbd_input(img_bgr, depth)
+            resized = cv2.resize(fused, (input_size, input_size))
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            arr = _prepare_ort_input(rgb)
+            out = ort_session.run([ort_output_name], {ort_input_name: arr})[0]
+            out = np.asarray(out).reshape(-1, 3)
+            h, w = fused.shape[:2]
+            kps = []
+            for (y, x, c) in out:
+                u = float(x) * w
+                v = float(y) * h
+                kps.append([u, v, float(c)])
+            poses = [np.array(kps, dtype=np.float32)]
+            scores = depth_weighted_scores(poses, [1.0], depth)
+            return poses, scores
+
+        return runner
+
     try:
         net = cv2.dnn.readNetFromONNX(onnx_path)
     except Exception as exc:  # pragma: no cover - depends on optional assets
