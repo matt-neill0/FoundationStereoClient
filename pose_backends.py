@@ -310,13 +310,63 @@ def _build_movenet_backend(log: Callable[[str], None], key: str) -> Optional[Pos
 def _resolve_openpose_paths() -> Tuple[str, str]:
     proto = os.getenv(
         "OPENPOSE_PROTO",
-        "pose_deploy_linevec_faster_4_stages.prototxt",
+        "pose_deploy_linevec.prototxt",
     )
     weights = os.getenv(
         "OPENPOSE_WEIGHTS",
         "pose_iter_440000.caffemodel",
     )
     return proto, weights
+
+_OPENPOSE_TOTAL_TO_HEATMAP_COUNT = {
+    57: 19,  # COCO body (18 keypoints + background) + 38 PAF maps
+    78: 26,  # Body-25 (25 keypoints + background) + 52 PAF maps
+    44: 16,  # MPI (15 keypoints + background) + 28 PAF maps
+}
+
+
+_OPENPOSE_JOINT_MAP_TO_COCO17: Dict[int, Sequence[int]] = {
+    # OpenPose COCO layout (18 joints, excluding background)
+    18: (
+        0,  # nose
+        15,  # left eye
+        14,  # right eye
+        17,  # left ear
+        16,  # right ear
+        5,  # left shoulder
+        2,  # right shoulder
+        6,  # left elbow
+        3,  # right elbow
+        7,  # left wrist
+        4,  # right wrist
+        11,  # left hip
+        8,  # right hip
+        12,  # left knee
+        9,  # right knee
+        13,  # left ankle
+        10,  # right ankle
+    ),
+    # OpenPose Body-25 layout (25 joints, excluding background)
+    25: (
+        0,  # nose
+        16,  # left eye
+        15,  # right eye
+        18,  # left ear
+        17,  # right ear
+        5,  # left shoulder
+        2,  # right shoulder
+        6,  # left elbow
+        3,  # right elbow
+        7,  # left wrist
+        4,  # right wrist
+        12,  # left hip
+        9,  # right hip
+        13,  # left knee
+        10,  # right knee
+        14,  # left ankle
+        11,  # right ankle
+    ),
+}
 
 
 def _build_openpose_backend(log: Callable[[str], None], key: str) -> Optional[PoseBackend]:
@@ -326,6 +376,8 @@ def _build_openpose_backend(log: Callable[[str], None], key: str) -> Optional[Po
     except Exception as exc:  # pragma: no cover - optional assets
         log(f"[pose] OpenPose model failed to load (proto='{proto}', weights='{weights}'): {exc}")
         return None
+
+    warned_layouts: set[int] = set()
 
     def runner(img_bgr: np.ndarray, depth: Optional[np.ndarray]):
         fused = compose_rgbd_input(img_bgr, depth)
@@ -338,16 +390,57 @@ def _build_openpose_backend(log: Callable[[str], None], key: str) -> Optional[Po
             crop=False,
         )
         net.setInput(blob)
-        out = net.forward()
-        num_points = out.shape[1]
-        heat_h, heat_w = out.shape[2:]
+
+        try:
+            out = net.forward()
+        except cv2.error as exc:
+            err_msg = exc.err if hasattr(exc, "err") else str(exc)
+            err_msg = err_msg.strip() or "OpenPose forward pass failed."
+            if exc.code == -209 or "reshape" in err_msg.lower():
+                hint = (
+                    "Ensure that OPENPOSE_PROTO matches OPENPOSE_WEIGHTS (e.g. do not mix "
+                    "Body-25 weights with the COCO prototxt)."
+                )
+            else:
+                hint = "OpenPose forward pass failed."
+            formatted = err_msg.rstrip(". ")
+            raise RuntimeError(
+                f"[pose] backend failed: {formatted}. {hint}"
+            ) from exc
+
+        total_maps = out.shape[1]
+        heatmap_count = _OPENPOSE_TOTAL_TO_HEATMAP_COUNT.get(total_maps, total_maps)
+        heatmap_offset = max(0, total_maps - heatmap_count)
+        heatmaps = out[0, heatmap_offset: heatmap_offset + heatmap_count, :, :]
+        if heatmaps.size == 0:
+            return [], []
+
+        joint_heatmaps = heatmaps[:-1] if heatmaps.shape[0] > 1 else heatmaps
+        joint_count = joint_heatmaps.shape[0]
+        mapping = _OPENPOSE_JOINT_MAP_TO_COCO17.get(joint_count)
+        if mapping is None:
+            if joint_count not in warned_layouts:
+                log(
+                    "[pose] OpenPose returned %d joint heatmaps; falling back to the first %d"
+                    " channels."
+                    % (joint_count, min(joint_count, 17))
+                )
+                warned_layouts.add(joint_count)
+            selected_indices = list(range(min(joint_count, 17)))
+        else:
+            selected_indices = list(mapping)
+
+        heat_h, heat_w = joint_heatmaps.shape[1:]
+
         points: List[List[float]] = []
-        for idx in range(num_points - 1):  # last channel is background
-            heat_map = out[0, idx, :, :]
+        for idx in selected_indices:
+            heat_map = joint_heatmaps[idx]
             _, conf, _, point = cv2.minMaxLoc(heat_map)
             x = (img_bgr.shape[1] * point[0]) / heat_w
             y = (img_bgr.shape[0] * point[1]) / heat_h
             points.append([float(x), float(y), float(conf)])
+        if len(points) < 17:
+            points.extend([[float("nan"), float("nan"), 0.0]] * (17 - len(points)))
         poses = [np.array(points[:17], dtype=np.float32)]
         scores = depth_weighted_scores(poses, [1.0], depth)
         return poses, scores
