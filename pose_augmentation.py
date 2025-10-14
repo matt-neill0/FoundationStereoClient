@@ -48,15 +48,13 @@ class PoseModelInfo:
 
 _POSE_MODELS: Tuple[PoseModelInfo, ...] = (
     PoseModelInfo(
-        key="openpose",
-        display_name="OpenPose",
+        key="yolov8",
+        display_name="YOLOv8 Pose",
         description=(
-            "Canonical multi-person pose estimator with strong multi-view support. "
-            "Depth cues can be used for late fusion to improve skeleton selection."
+            "Ultralytics YOLOv8 pose estimator supporting multi-person detection. "
+            "Depth-aware scoring improves skeleton disambiguation in cluttered scenes."
         ),
     ),
-
-    # ↓ Split MoveNet into two variants
     PoseModelInfo(
         key="movenet_lightning",
         display_name="MoveNet Lightning (192×192)",

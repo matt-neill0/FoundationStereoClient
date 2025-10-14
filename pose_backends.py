@@ -306,146 +306,98 @@ def _build_movenet_backend(log: Callable[[str], None], key: str) -> Optional[Pos
     log(f"[pose] MoveNet backend initialised from '{onnx_path}'.")
     return runner
 
+def _resolve_yolov8_pose_model(key: str) -> str:
+    env_override = os.getenv("YOLOV8_POSE_MODEL")
+    if env_override:
+        return env_override
+    lowered = key.lower()
+    if lowered.endswith(".pt") or lowered.endswith(".onnx"):
+        return key
+    for variant in ("n", "s", "m", "l", "x"):
+        token = f"yolov8{variant}"
+        if token in lowered:
+            return f"{token}-pose.pt"
+    return "yolov8n-pose.pt"
 
-def _resolve_openpose_paths() -> Tuple[str, str]:
-    proto = os.getenv(
-        "OPENPOSE_PROTO",
-        "pose_deploy_linevec.prototxt",
-    )
-    weights = os.getenv(
-        "OPENPOSE_WEIGHTS",
-        "pose_iter_440000.caffemodel",
-    )
-    return proto, weights
-
-_OPENPOSE_TOTAL_TO_HEATMAP_COUNT = {
-    57: 19,  # COCO body (18 keypoints + background) + 38 PAF maps
-    78: 26,  # Body-25 (25 keypoints + background) + 52 PAF maps
-    44: 16,  # MPI (15 keypoints + background) + 28 PAF maps
-}
-
-
-_OPENPOSE_JOINT_MAP_TO_COCO17: Dict[int, Sequence[int]] = {
-    # OpenPose COCO layout (18 joints, excluding background)
-    18: (
-        0,  # nose
-        15,  # left eye
-        14,  # right eye
-        17,  # left ear
-        16,  # right ear
-        5,  # left shoulder
-        2,  # right shoulder
-        6,  # left elbow
-        3,  # right elbow
-        7,  # left wrist
-        4,  # right wrist
-        11,  # left hip
-        8,  # right hip
-        12,  # left knee
-        9,  # right knee
-        13,  # left ankle
-        10,  # right ankle
-    ),
-    # OpenPose Body-25 layout (25 joints, excluding background)
-    25: (
-        0,  # nose
-        16,  # left eye
-        15,  # right eye
-        18,  # left ear
-        17,  # right ear
-        5,  # left shoulder
-        2,  # right shoulder
-        6,  # left elbow
-        3,  # right elbow
-        7,  # left wrist
-        4,  # right wrist
-        12,  # left hip
-        9,  # right hip
-        13,  # left knee
-        10,  # right knee
-        14,  # left ankle
-        11,  # right ankle
-    ),
-}
-
-
-def _build_openpose_backend(log: Callable[[str], None], key: str) -> Optional[PoseBackend]:
-    proto, weights = _resolve_openpose_paths()
+def _build_yolov8_pose_backend(log: Callable[[str], None], key: str) -> Optional[PoseBackend]:
     try:
-        net = cv2.dnn.readNetFromCaffe(proto, weights)
-    except Exception as exc:  # pragma: no cover - optional assets
-        log(f"[pose] OpenPose model failed to load (proto='{proto}', weights='{weights}'): {exc}")
+        from ultralytics import YOLO  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log(f"[pose] Ultralytics YOLO not available; skipping YOLOv8 backend ({exc}).")
         return None
 
-    warned_layouts: set[int] = set()
+    model_path = _resolve_yolov8_pose_model(key)
+    try:  # pragma: no cover - depends on optional assets
+        model = YOLO(model_path)
+    except Exception as exc:
+        log(f"[pose] YOLOv8 pose model failed to load from '{model_path}': {exc}")
+        return None
+
+    try:
+        import torch
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log(f"[pose] PyTorch not available; skipping YOLOv8 backend ({exc}).")
+        return None
+
+    inference_context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
+
 
     def runner(img_bgr: np.ndarray, depth: Optional[np.ndarray]):
         fused = compose_rgbd_input(img_bgr, depth)
-        blob = cv2.dnn.blobFromImage(
-            fused,
-            scalefactor=1.0 / 255,
-            size=(368, 368),
-            mean=(0, 0, 0),
-            swapRB=False,
-            crop=False,
-        )
-        net.setInput(blob)
+        rgb = cv2.cvtColor(fused, cv2.COLOR_BGR2RGB)
 
-        try:
-            out = net.forward()
-        except cv2.error as exc:
-            err_msg = exc.err if hasattr(exc, "err") else str(exc)
-            err_msg = err_msg.strip() or "OpenPose forward pass failed."
-            if exc.code == -209 or "reshape" in err_msg.lower():
-                hint = (
-                    "Ensure that OPENPOSE_PROTO matches OPENPOSE_WEIGHTS (e.g. do not mix "
-                    "Body-25 weights with the COCO prototxt)."
-                )
-            else:
-                hint = "OpenPose forward pass failed."
-            formatted = err_msg.rstrip(". ")
-            raise RuntimeError(
-                f"[pose] backend failed: {formatted}. {hint}"
-            ) from exc
+        with inference_context():
+            results = model.predict(rgb, verbose=False)
 
-        total_maps = out.shape[1]
-        heatmap_count = _OPENPOSE_TOTAL_TO_HEATMAP_COUNT.get(total_maps, total_maps)
-        heatmap_offset = max(0, total_maps - heatmap_count)
-        heatmaps = out[0, heatmap_offset: heatmap_offset + heatmap_count, :, :]
-        if heatmaps.size == 0:
+        if not results:
             return [], []
 
-        joint_heatmaps = heatmaps[:-1] if heatmaps.shape[0] > 1 else heatmaps
-        joint_count = joint_heatmaps.shape[0]
-        mapping = _OPENPOSE_JOINT_MAP_TO_COCO17.get(joint_count)
-        if mapping is None:
-            if joint_count not in warned_layouts:
-                log(
-                    "[pose] OpenPose returned %d joint heatmaps; falling back to the first %d"
-                    " channels."
-                    % (joint_count, min(joint_count, 17))
-                )
-                warned_layouts.add(joint_count)
-            selected_indices = list(range(min(joint_count, 17)))
+        result = results[0]
+        keypoints = getattr(result, "keypoints", None)
+        if keypoints is None:
+            return [], []
+
+        xy = getattr(keypoints, "xy", None)
+        if xy is None:
+            return [], []
+
+        conf = getattr(keypoints, "conf", None)
+
+        if hasattr(xy, "cpu"):
+            xy_np = xy.cpu().numpy()
         else:
-            selected_indices = list(mapping)
+            xy_np = np.asarray(xy)
 
-        heat_h, heat_w = joint_heatmaps.shape[1:]
+        conf_np: Optional[np.ndarray]
+        if conf is None:
+            conf_np = None
+        elif hasattr(conf, "cpu"):
+            conf_np = conf.cpu().numpy()
+        else:
+            conf_np = np.asarray(conf)
 
-        points: List[List[float]] = []
-        for idx in selected_indices:
-            heat_map = joint_heatmaps[idx]
-            _, conf, _, point = cv2.minMaxLoc(heat_map)
-            x = (img_bgr.shape[1] * point[0]) / heat_w
-            y = (img_bgr.shape[0] * point[1]) / heat_h
-            points.append([float(x), float(y), float(conf)])
-        if len(points) < 17:
-            points.extend([[float("nan"), float("nan"), 0.0]] * (17 - len(points)))
-        poses = [np.array(points[:17], dtype=np.float32)]
-        scores = depth_weighted_scores(poses, [1.0], depth)
+        poses: List[np.ndarray] = []
+        scores: List[float] = []
+        for idx in range(xy_np.shape[0]):
+            coords = xy_np[idx]
+            if conf_np is not None:
+                coord_conf = conf_np[idx]
+            else:
+                coord_conf = np.ones(coords.shape[0], dtype=np.float32)
+
+            keypoints_list: List[List[float]] = []
+            for (x, y), c in zip(coords, coord_conf):
+                conf_val = float(c) if np.isfinite(c) else 0.0
+                keypoints_list.append([float(x), float(y), conf_val])
+
+            poses.append(np.array(keypoints_list[:17], dtype=np.float32))
+            mean_conf = float(np.nanmean(coord_conf)) if coord_conf.size else 0.0
+            scores.append(mean_conf if np.isfinite(mean_conf) else 0.0)
+
+        scores = depth_weighted_scores(poses, scores, depth)
         return poses, scores
 
-    log("[pose] OpenPose backend initialised.")
+    log(f"[pose] YOLOv8 backend initialised from '{model_path}'.")
     return runner
 
 
@@ -455,14 +407,14 @@ _POSE_BACKEND_BUILDERS: Dict[str, Builder] = {
     "blazepose": _build_blazepose_backend,
     "holistic": _build_holistic_backend,
     "movenet": _build_movenet_backend,
-    "openpose": _build_openpose_backend,
+    "yolov8": _build_yolov8_pose_backend,
 }
 
 _PREFERRED_BACKEND_ORDER: Tuple[str, ...] = (
     "blazepose",
     "holistic",
     "movenet",
-    "openpose",
+    "yolov8",
 )
 
 
