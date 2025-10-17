@@ -414,7 +414,7 @@ class LocalEngineRunner:
             self._log(f"[local] Failed to encode disparity: {exc}")
             raise
 
-    def _emit_disparity_result(self, seq: int, png16: bytes) -> None:
+    def _result_metadata(self) -> Dict[str, Any]:
         meta = {
             "session_id": self.session_id,
             "source_mode": self.mode,
@@ -425,13 +425,19 @@ class LocalEngineRunner:
             "pose": self._pose_metadata(),
             "poses": getattr(self, "_last_pose_meta", []),
         }
-        if self._use_realsense and self._rs_fx_px is not None and self._rs_baseline_m is not None:
+        if (
+            self._use_realsense
+            and self._rs_fx_px is not None
+            and self._rs_baseline_m is not None
+        ):
             meta["fx_px"] = float(self._rs_fx_px)
             meta["baseline_m"] = float(self._rs_baseline_m)
         return meta
 
-    def _emit_result(self, seq: int, png16: bytes, meta: Dict[str, Any]) -> None:
-        payload_meta = dict(meta)
+    def _emit_disparity_result(
+        self, seq: int, png16: bytes, meta: Optional[Dict[str, Any]] = None
+    ) -> None:
+        payload_meta = dict(meta or self._result_metadata())
         self.on_result(
             seq,
             "disparity",
@@ -443,47 +449,30 @@ class LocalEngineRunner:
         )
 
     def _emit_pose_preview(
-            self, seq: int, preview_bgr: np.ndarray, meta: Dict[str, Any]
+        self,
+        seq: int,
+        frame_bgr: np.ndarray,
+        fps: float,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
-        ok, buf = cv2.imencode(".jpg", preview_bgr)
-        if not ok:
-            self._log("[pose] Failed to encode pose preview frame.")
-            return
-        payload_meta = dict(meta)
-        payload_meta["preview_contains_poses"] = bool(meta.get("poses"))
-        self.on_result(
-            seq,
-            "rgb_preview",
-            "jpg",
-            int(preview_bgr.shape[1]),
-            int(preview_bgr.shape[0]),
-            buf.tobytes(),
-            payload_meta,
-        )
-
-    def _emit_pose_preview(self, seq: int, frame_bgr: np.ndarray, fps: float) -> None:
         preview = np.ascontiguousarray(frame_bgr)
         ok, buf = cv2.imencode(".jpg", preview)
         if not ok:
             self._log("[pose] Failed to encode pose preview frame.")
             return
 
-        meta = {
-            "session_id": self.session_id,
-            "source_mode": self.mode,
-            "sender_wh": [int(self.frame_width), int(self.frame_height)],
-            "pose": self._pose_metadata(),
-            "poses": getattr(self, "_last_pose_meta", []),
-            "fps_est": float(fps),
-        }
+        payload_meta = dict(meta or self._result_metadata())
+        payload_meta["fps_est"] = float(fps)
+        payload_meta["preview_contains_poses"] = bool(payload_meta.get("poses"))
+
         self.on_result(
             seq,
             "pose_preview",
             "jpg",
-            int(self.frame_width),
-            int(self.frame_height),
+            int(preview.shape[1]),
+            int(preview.shape[0]),
             buf.tobytes(),
-            meta,
+            payload_meta,
         )
 
     def _ensure_save_dir(self) -> None:
@@ -500,9 +489,77 @@ class LocalEngineRunner:
         with open(fname, "wb") as f:
             f.write(png16)
 
+    def _preview_frame_source(self, left_bgr: np.ndarray) -> np.ndarray:
+        if not self.preview:
+            return left_bgr
+        return self._preview_display_frame(left_bgr)
+
+    def _visualize_disparity(self, disparity: np.ndarray) -> np.ndarray:
+        disp = np.asarray(disparity, dtype=np.float32)
+        disp = np.nan_to_num(disp, nan=0.0, posinf=0.0, neginf=0.0)
+        if disp.size == 0:
+            return np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+
+        if self.max_disp and self.max_disp > 0:
+            norm = float(self.max_disp)
+        else:
+            positives = disp[disp > 0]
+            norm = float(np.percentile(positives, 99.0)) if positives.size else 1.0
+        norm = max(norm, 1e-3)
+
+        vis_gray = np.clip((disp / norm) * 255.0, 0.0, 255.0).astype(np.uint8)
+        vis_gray[disp <= 0] = 0
+        vis = cv2.applyColorMap(vis_gray, cv2.COLORMAP_INFERNO)
+        return vis
+
+    def _compose_preview_frame(
+        self,
+        base_bgr: np.ndarray,
+        disp: Optional[np.ndarray],
+        fps: float,
+        poses_uvc: Optional[List[np.ndarray]] = None,
+        preview_bgr: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        frame = np.ascontiguousarray(preview_bgr if preview_bgr is not None else base_bgr)
+        vis = frame.copy()
+
+        if poses_uvc:
+            model_key = self._resolved_pose_key or self.pose_model or "coco17"
+            try:
+                vis = draw_skeletons(
+                    vis,
+                    [np.asarray(p, dtype=np.float32) for p in poses_uvc],
+                    model_key,
+                )
+            except Exception as exc:
+                self._log(f"[pose] Failed to draw skeletons: {exc}")
+
+        fps_text = f"{fps:.1f} FPS"
+        cv2.putText(
+            vis,
+            fps_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+        )
+
+        if disp is None:
+            return vis
+
+        disp_vis = self._visualize_disparity(disp)
+        disp_vis = cv2.resize(
+            disp_vis,
+            (vis.shape[1], vis.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        combo = np.concatenate([vis, disp_vis], axis=1)
+        return np.ascontiguousarray(combo)
+
     def _render_preview(
             self,
-            left_bgr: np.ndarray,
+            base_bgr: np.ndarray,
             disp: Optional[np.ndarray],
             fps: float,
             poses_uvc: Optional[List[np.ndarray]] = None,
@@ -510,7 +567,13 @@ class LocalEngineRunner:
     ) -> bool:
         if not self.preview:
             return False
-        combo = self._compose_preview_frame(left_bgr, disp, fps, poses_uvc)
+        combo = self._compose_preview_frame(
+            base_bgr,
+            disp,
+            fps,
+            poses_uvc,
+            preview_bgr=preview_bgr,
+        )
         cv2.imshow("FoundationStereo TensorRT", combo)
         if cv2.waitKey(1) & 0xFF == 27:
             self._log("[local] ESC pressed – stopping preview")
@@ -668,18 +731,18 @@ class LocalEngineRunner:
 
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
-                        self._emit_disparity_result(seq, png16)
+                        self._emit_disparity_result(seq, png16, meta)
                         self._save_result(seq, png16)
                     else:
-                        self._emit_pose_preview(seq, left_bgr, fps)
+                        self._emit_pose_preview(seq, preview_base, fps, meta)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
                     if self._render_preview(
-                        left_bgr,
+                        preview_base,
                         disp,
                         fps,
                         preview_poses,
-                        display_bgr=display_frame,
+                        preview_bgr=preview_base,
                     ):
                         break
 
