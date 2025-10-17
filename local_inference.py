@@ -407,29 +407,23 @@ class LocalEngineRunner:
 
         return left_bgr, right_bgr
 
-    def _select_preview_frame(self, fallback: np.ndarray) -> np.ndarray:
+    def _realsense_preview_frame(self) -> Optional[np.ndarray]:
         if not self._use_realsense or cam is None:
-            return fallback
+            return None
 
         preview = cam.get_preview_frame()
-        preview_bgr: Optional[np.ndarray]
-        if preview is not None:
-            preview_bgr = np.asanyarray(preview).copy()
-            if preview_bgr.ndim == 2:
-                preview_bgr = cv2.cvtColor(preview_bgr, cv2.COLOR_GRAY2BGR)
-            if preview_bgr.shape[0] != fallback.shape[0] or preview_bgr.shape[1] != fallback.shape[1]:
-                preview_bgr = cv2.resize(
-                    preview_bgr,
-                    (fallback.shape[1], fallback.shape[0]),
-                    interpolation=cv2.INTER_AREA,
-                )
-            self._latest_preview_bgr = preview_bgr
-        else:
-            preview_bgr = self._latest_preview_bgr
+        if preview is None:
+            return None
 
-        if preview_bgr is None:
-            return fallback
-        return preview_bgr
+        preview_r = self._resize_frame(preview)
+        if preview_r.ndim == 2:
+            return cv2.cvtColor(preview_r, cv2.COLOR_GRAY2BGR)
+        if preview_r.ndim == 3:
+            if preview_r.shape[2] == 3:
+                return preview_r
+            if preview_r.shape[2] > 3:
+                return preview_r[:, :, :3]
+        return None
 
     def _encode_disparity(self, disp: np.ndarray) -> bytes:
         try:
@@ -683,15 +677,17 @@ class LocalEngineRunner:
 
                     fps = 1.0 / max(time.perf_counter() - start, 1e-6)
 
+                    preview_base = self._realsense_preview_frame() or left_bgr
+
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
                         self._emit_result(seq, png16)
                         self._save_result(seq, png16)
                     else:
-                        self._emit_rgb_preview(seq, preview_source)
+                        self._emit_rgb_preview(seq, preview_base)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
-                    preview_frame = self._apply_pose_overlay(preview_source, preview_poses)
+                    preview_frame = self._apply_pose_overlay(preview_base, preview_poses)
 
                     if disp is None:
                         self._emit_rgb_preview(seq, preview_frame)
