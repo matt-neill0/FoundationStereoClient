@@ -413,17 +413,14 @@ class LocalEngineRunner:
             self._log(f"[local] Failed to encode disparity: {exc}")
             raise
 
-    def _build_result_meta(self) -> Dict[str, Any]:
+    def _common_meta(self) -> Dict[str, Any]:
         meta: Dict[str, Any] = {
             "session_id": self.session_id,
             "source_mode": self.mode,
             "sender_wh": [int(self.frame_width), int(self.frame_height)],
             "realsense": bool(self._use_realsense),
-            "disp_scale": float(self.disp_scale),
-            "max_disp": float(self.max_disp),
             "pose": self._pose_metadata(),
             "poses": getattr(self, "_last_pose_meta", []),
-            "depth_enabled": bool(self.depth_enabled),
         }
         if (
             self._use_realsense
@@ -435,7 +432,9 @@ class LocalEngineRunner:
         return meta
 
     def _emit_result(self, seq: int, png16: bytes) -> None:
-        meta = self._build_result_meta()
+        meta = self._common_meta()
+        meta["disp_scale"] = float(self.disp_scale)
+        meta["max_disp"] = float(self.max_disp)
         self.on_result(
             seq,
             "disparity",
@@ -446,23 +445,19 @@ class LocalEngineRunner:
             meta,
         )
 
-    def _emit_rgb_preview(self, seq: int, frame_bgr: np.ndarray) -> None:
-        try:
-            ok, buf = cv2.imencode(".jpg", frame_bgr)
-        except Exception as exc:
-            self._log(f"[local] Failed to encode RGB preview: {exc}")
-            return
+    def _emit_rgb_preview(self, seq: int, image_bgr: np.ndarray) -> None:
+        meta = self._common_meta()
+        preview = np.ascontiguousarray(image_bgr)
+        ok, buf = cv2.imencode(".jpg", preview)
         if not ok:
-            self._log("[local] cv2.imencode failed for RGB preview frame")
+            self._log("[local] Failed to encode RGB preview frame.")
             return
-
-        meta = self._build_result_meta()
         self.on_result(
             seq,
             "rgb_preview",
             "jpeg",
-            int(frame_bgr.shape[1]),
-            int(frame_bgr.shape[0]),
+            int(self.frame_width),
+            int(self.frame_height),
             buf.tobytes(),
             meta,
         )
@@ -481,25 +476,30 @@ class LocalEngineRunner:
         with open(fname, "wb") as f:
             f.write(png16)
 
+    def _apply_pose_overlay(
+        self, image_bgr: np.ndarray, poses_uvc: Optional[List[np.ndarray]]
+    ) -> np.ndarray:
+        if not poses_uvc:
+            return image_bgr
+        try:
+            return draw_skeletons(
+                image_bgr,
+                [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
+                self._resolved_pose_key or self.pose_model,
+            )
+        except Exception as exc:
+            self._log(f"[pose] Failed to draw preview skeletons: {exc}")
+            return image_bgr
+
     def _render_preview(
-            self,
-            left_bgr: np.ndarray,
-            disp: Optional[np.ndarray],
-            fps: float,
-            poses_uvc: Optional[List[np.ndarray]] = None,
+        self,
+        base_bgr: np.ndarray,
+        disp: Optional[np.ndarray],
+        fps: float,
     ) -> bool:
         if not self.preview:
             return False
-        base = left_bgr
-        if poses_uvc:
-            try:
-                base = draw_skeletons(
-                    base,
-                    [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
-                    self._resolved_pose_key or self.pose_model,
-                )
-            except Exception as exc:
-                self._log(f"[pose] Failed to draw preview skeletons: {exc}")
+        base = base_bgr
 
         if disp is not None:
             disp_color = _normalize_for_display(disp)
@@ -665,7 +665,12 @@ class LocalEngineRunner:
                         self._emit_rgb_preview(seq, left_bgr)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
-                    if self._render_preview(left_bgr, disp, fps, preview_poses):
+                    preview_frame = self._apply_pose_overlay(left_bgr, preview_poses)
+
+                    if disp is None:
+                        self._emit_rgb_preview(seq, preview_frame)
+
+                    if self._render_preview(preview_frame, disp, fps):
                         break
 
                     seq += 1
