@@ -413,8 +413,8 @@ class LocalEngineRunner:
             self._log(f"[local] Failed to encode disparity: {exc}")
             raise
 
-    def _emit_result(self, seq: int, png16: bytes) -> None:
-        meta = {
+    def _build_result_meta(self) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {
             "session_id": self.session_id,
             "source_mode": self.mode,
             "sender_wh": [int(self.frame_width), int(self.frame_height)],
@@ -422,11 +422,20 @@ class LocalEngineRunner:
             "disp_scale": float(self.disp_scale),
             "max_disp": float(self.max_disp),
             "pose": self._pose_metadata(),
-            "poses": getattr(self, "_last_pose_meta", [])
+            "poses": getattr(self, "_last_pose_meta", []),
+            "depth_enabled": bool(self.depth_enabled),
         }
-        if self._use_realsense and self._rs_fx_px is not None and self._rs_baseline_m is not None:
+        if (
+            self._use_realsense
+            and self._rs_fx_px is not None
+            and self._rs_baseline_m is not None
+        ):
             meta["fx_px"] = float(self._rs_fx_px)
             meta["baseline_m"] = float(self._rs_baseline_m)
+        return meta
+
+    def _emit_result(self, seq: int, png16: bytes) -> None:
+        meta = self._build_result_meta()
         self.on_result(
             seq,
             "disparity",
@@ -434,6 +443,27 @@ class LocalEngineRunner:
             int(self.frame_width),
             int(self.frame_height),
             png16,
+            meta,
+        )
+
+    def _emit_rgb_preview(self, seq: int, frame_bgr: np.ndarray) -> None:
+        try:
+            ok, buf = cv2.imencode(".jpg", frame_bgr)
+        except Exception as exc:
+            self._log(f"[local] Failed to encode RGB preview: {exc}")
+            return
+        if not ok:
+            self._log("[local] cv2.imencode failed for RGB preview frame")
+            return
+
+        meta = self._build_result_meta()
+        self.on_result(
+            seq,
+            "rgb_preview",
+            "jpeg",
+            int(frame_bgr.shape[1]),
+            int(frame_bgr.shape[0]),
+            buf.tobytes(),
             meta,
         )
 
@@ -631,6 +661,8 @@ class LocalEngineRunner:
                         png16 = self._encode_disparity(disp)
                         self._emit_result(seq, png16)
                         self._save_result(seq, png16)
+                    else:
+                        self._emit_rgb_preview(seq, left_bgr)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
                     if self._render_preview(left_bgr, disp, fps, preview_poses):
