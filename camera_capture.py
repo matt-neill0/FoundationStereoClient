@@ -107,7 +107,16 @@ def capture_realsense() -> None:
                 _ready.set()
 
             while not _stop_flag:
-                frames = pipeline.wait_for_frames(timeout_ms=250)
+                try:
+                    frames = pipeline.wait_for_frames(timeout_ms=500)
+                except RuntimeError as exc:  # pragma: no cover - hardware timing path
+                    # RealSense pipelines occasionally time out if no frames arrive within
+                    # the timeout window.  Treat that as a transient condition so we don't
+                    # tear the pipeline down and spam the logs unless something more
+                    # serious occurs.
+                    if "Frame didn't arrive within" in str(exc):
+                        continue
+                    raise
                 ir_l = frames.get_infrared_frame(1)
                 ir_r = frames.get_infrared_frame(2)
                 color = frames.get_color_frame() if color_enabled else None
