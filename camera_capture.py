@@ -20,8 +20,9 @@ except Exception:  # pragma: no cover - optional dependency
 
 # ───────────────────────── shared state ─────────────────────────
 _lock = threading.Lock()  # guards every read/write to _frame1/_frame2
-_frame1: Optional[np.ndarray] = None  # latest LEFT  frame (NumPy uint8, Gray)
-_frame2: Optional[np.ndarray] = None  # latest RIGHT frame (NumPy uint8, Gray)
+_frame1: Optional[np.ndarray] = None  # latest LEFT  frame (NumPy uint8, Gray/RGB)
+_frame2: Optional[np.ndarray] = None  # latest RIGHT frame (NumPy uint8, Gray/RGB)
+_color_frame: Optional[np.ndarray] = None  # latest RealSense colour frame (BGR)
 _stop_flag = False  # set → all threads exit cleanly
 _ready = threading.Event()  # set once fx + baseline are known
 
@@ -66,8 +67,8 @@ def _rs_device_available(timeout_s: int = 2) -> bool:
 
 
 def capture_realsense() -> None:
-    """Continuously grab Infra 1 and Infra 2 grayscale frames from RealSense."""
-    global _frame1, _frame2, _fx, _baseline_m, _stop_flag
+    """Continuously grab Infra 1/2 grayscale + colour frames from RealSense."""
+    global _frame1, _frame2, _color_frame, _fx, _baseline_m, _stop_flag
 
     if rs is None:
         print("[CameraCapture] pyrealsense2 is not installed → cannot use RealSense")
@@ -83,6 +84,8 @@ def capture_realsense() -> None:
         pipeline, cfg = rs.pipeline(), rs.config()
         cfg.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 30)
         cfg.enable_stream(rs.stream.infrared, 2, 640, 480, rs.format.y8, 30)
+        with contextlib.suppress(Exception):
+            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
         try:
             prof = pipeline.start(cfg)
@@ -101,14 +104,30 @@ def capture_realsense() -> None:
                 _ready.set()
 
             while not _stop_flag:
-                frames = pipeline.wait_for_frames(timeout_ms=250)
+                try:
+                    frames = pipeline.wait_for_frames(timeout_ms=500)
+                except RuntimeError as exc:  # pragma: no cover - hardware timing path
+                    # RealSense pipelines occasionally time out if no frames arrive within
+                    # the timeout window.  Treat that as a transient condition so we don't
+                    # tear the pipeline down and spam the logs unless something more
+                    # serious occurs.
+                    if "Frame didn't arrive within" in str(exc):
+                        continue
+                    raise
                 ir_l = frames.get_infrared_frame(1)
                 ir_r = frames.get_infrared_frame(2)
                 if not ir_l or not ir_r:
                     continue
+                color_frame = None
+                with contextlib.suppress(Exception):
+                    color = frames.get_color_frame()
+                    if color:
+                        color_frame = np.asanyarray(color.get_data()).copy()
                 with _lock:
                     _frame1 = np.asanyarray(ir_l.get_data())
                     _frame2 = np.asanyarray(ir_r.get_data())
+                    if color_frame is not None:
+                        _color_frame = color_frame
 
         except Exception as e:  # pragma: no cover - hardware error path
             print(f"[CameraCapture] RealSense error → {e}")
@@ -127,6 +146,14 @@ def get_frames() -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     return left, right
 
 
+def get_color_frame() -> Optional[np.ndarray]:
+    """Return the latest RealSense colour frame if available."""
+    with _lock:
+        if _color_frame is None:
+            return None
+        return _color_frame.copy()
+
+
 def get_calibration() -> tuple[float, float]:
     """Block until calibration is known, then return (fx_px, baseline_m)."""
     _ready.wait()
@@ -143,10 +170,11 @@ def signal_stop() -> None:
 
 def reset_state() -> None:
     """Reset cached frames/calibration. Useful between successive runs."""
-    global _frame1, _frame2, _stop_flag, _fx, _baseline_m
+    global _frame1, _frame2, _color_frame, _stop_flag, _fx, _baseline_m
     with _lock:
         _frame1 = None
         _frame2 = None
+        _color_frame = None
     _stop_flag = False
     _fx = None
     _baseline_m = None
