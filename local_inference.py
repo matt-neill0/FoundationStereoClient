@@ -425,6 +425,23 @@ class LocalEngineRunner:
                 return preview_r[:, :, :3]
         return None
 
+    def _select_preview_frame(self, left_bgr: np.ndarray) -> np.ndarray:
+        """Return the best preview frame available for display.
+
+        We prefer the RealSense colour stream when available but fall back to
+        the most recent preview or the rectified left frame otherwise.
+        """
+
+        latest = self._realsense_preview_frame()
+        if latest is not None:
+            self._latest_preview_bgr = latest
+            return latest
+
+        if self._latest_preview_bgr is not None:
+            return self._latest_preview_bgr
+
+        return left_bgr
+
     def _encode_disparity(self, disp: np.ndarray) -> bytes:
         try:
             return disparity_to_png16(disp, self.max_disp, self.disp_scale)
@@ -580,7 +597,8 @@ class LocalEngineRunner:
                     if self._stop_event.is_set():
                         break
                     left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
-                    preview_source = self._select_preview_frame(left_bgr)
+                    preview_base = self._select_preview_frame(left_bgr)
+                    pose_source = left_bgr
 
                     start = time.perf_counter()
                     disp: Optional[np.ndarray]
@@ -600,7 +618,7 @@ class LocalEngineRunner:
                             self._pose_runner = self._init_pose_backend()
                         if self._pose_runner is not None:
                             try:
-                                poses_uvc, pose_scores = self._pose_runner(preview_source, depth_m)
+                                poses_uvc, pose_scores = self._pose_runner(pose_source, depth_m)
                             except Exception as exc:
                                 self._log(f"[pose] backend failed: {exc}")
                     if poses_uvc and depth_m is not None:
@@ -676,8 +694,6 @@ class LocalEngineRunner:
                             self._log(f"[pose] seq={seq} detections=0")
 
                     fps = 1.0 / max(time.perf_counter() - start, 1e-6)
-
-                    preview_base = self._realsense_preview_frame() or left_bgr
 
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
