@@ -256,6 +256,7 @@ class LocalEngineRunner:
             str(self.pose_model).lower() if self.pose_model else None
         )
         self._last_pose_meta: List[Dict[str, Any]] = []
+        self._latest_preview_bgr: Optional[np.ndarray] = None
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
         if override is not None:
@@ -405,6 +406,30 @@ class LocalEngineRunner:
             right_bgr = right_r
 
         return left_bgr, right_bgr
+
+    def _select_preview_frame(self, fallback: np.ndarray) -> np.ndarray:
+        if not self._use_realsense or cam is None:
+            return fallback
+
+        preview = cam.get_preview_frame()
+        preview_bgr: Optional[np.ndarray]
+        if preview is not None:
+            preview_bgr = np.asanyarray(preview).copy()
+            if preview_bgr.ndim == 2:
+                preview_bgr = cv2.cvtColor(preview_bgr, cv2.COLOR_GRAY2BGR)
+            if preview_bgr.shape[0] != fallback.shape[0] or preview_bgr.shape[1] != fallback.shape[1]:
+                preview_bgr = cv2.resize(
+                    preview_bgr,
+                    (fallback.shape[1], fallback.shape[0]),
+                    interpolation=cv2.INTER_AREA,
+                )
+            self._latest_preview_bgr = preview_bgr
+        else:
+            preview_bgr = self._latest_preview_bgr
+
+        if preview_bgr is None:
+            return fallback
+        return preview_bgr
 
     def _encode_disparity(self, disp: np.ndarray) -> bytes:
         try:
@@ -561,6 +586,7 @@ class LocalEngineRunner:
                     if self._stop_event.is_set():
                         break
                     left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
+                    preview_source = self._select_preview_frame(left_bgr)
 
                     start = time.perf_counter()
                     disp: Optional[np.ndarray]
@@ -580,7 +606,7 @@ class LocalEngineRunner:
                             self._pose_runner = self._init_pose_backend()
                         if self._pose_runner is not None:
                             try:
-                                poses_uvc, pose_scores = self._pose_runner(left_bgr, depth_m)
+                                poses_uvc, pose_scores = self._pose_runner(preview_source, depth_m)
                             except Exception as exc:
                                 self._log(f"[pose] backend failed: {exc}")
                     if poses_uvc and depth_m is not None:
@@ -662,10 +688,10 @@ class LocalEngineRunner:
                         self._emit_result(seq, png16)
                         self._save_result(seq, png16)
                     else:
-                        self._emit_rgb_preview(seq, left_bgr)
+                        self._emit_rgb_preview(seq, preview_source)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
-                    preview_frame = self._apply_pose_overlay(left_bgr, preview_poses)
+                    preview_frame = self._apply_pose_overlay(preview_source, preview_poses)
 
                     if disp is None:
                         self._emit_rgb_preview(seq, preview_frame)

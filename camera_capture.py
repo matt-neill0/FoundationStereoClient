@@ -122,12 +122,14 @@ def capture_realsense() -> None:
                 color = frames.get_color_frame() if color_enabled else None
                 if not ir_l or not ir_r:
                     continue
-                with contextlib.suppress(Exception):
-                    color = frames.get_color_frame()
+                if color is None:
+                    with contextlib.suppress(Exception):
+                        color = frames.get_color_frame()
                 with _lock:
-                    _frame1 = np.asanyarray(ir_l.get_data())
-                    _frame2 = np.asanyarray(ir_r.get_data())
-                    _preview_frame = np.asanyarray(color.get_data())
+                    _frame1 = np.asanyarray(ir_l.get_data()).copy()
+                    _frame2 = np.asanyarray(ir_r.get_data()).copy()
+                    if color is not None:
+                        _preview_frame = np.asanyarray(color.get_data()).copy()
 
         except Exception as e:  # pragma: no cover - hardware error path
             print(f"[CameraCapture] RealSense error → {e}")
