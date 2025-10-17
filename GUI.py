@@ -33,7 +33,7 @@ VIDEO_FILE_FILTER = "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)"
 
 @dataclass(frozen=True)
 class SessionConfig:
-    engine_path: str
+    engine_path: Optional[str]
     left_src: str
     right_src: str
     mode: str
@@ -46,7 +46,7 @@ class SessionConfig:
     use_realsense: bool
     pose_enabled: bool = False
     pose_model: Optional[str] = None
-
+    depth_enabled: bool = True
 
 def _linux_list_cameras_v4l2() -> List[Tuple[int, str]]:
     try:
@@ -114,7 +114,7 @@ class LocalEngineWorker(QtCore.QThread):
 
     def __init__(
             self,
-            engine_path: str,
+            engine_path: Optional[str],
             left_src: str,
             right_src: str,
             mode: str,
@@ -127,6 +127,7 @@ class LocalEngineWorker(QtCore.QThread):
             use_realsense: bool,
             pose_enabled: bool = False,
             pose_model: Optional[str] = None,
+            depth_enabled: bool = True
     ):
         super().__init__()
         self._start_emitted = False
@@ -160,6 +161,7 @@ class LocalEngineWorker(QtCore.QThread):
             use_realsense=use_realsense,
             pose_enabled=pose_enabled,
             pose_model=pose_model,
+            depth_enabled=depth_enabled
         )
 
     def run(self):
@@ -216,17 +218,24 @@ class MainWindow(QtWidgets.QMainWindow):
         depth_layout.addWidget(self.focal_px_edit, 0, 1)
         depth_layout.addWidget(QtWidgets.QLabel("Baseline(m)"), 1, 0)
         depth_layout.addWidget(self.baseline_m_edit, 1, 1)
-        self.pose_checkbox = QtWidgets.QCheckBox("Feed depth into pose estimation")
+        depth_layout.setColumnStretch(1, 1)
+
+        self.pose_group = QtWidgets.QGroupBox("Pose Options")
+        pose_layout = QtWidgets.QGridLayout(self.pose_group)
+        self.pose_checkbox = QtWidgets.QCheckBox("Enable pose estimation")
         self.pose_model_label = QtWidgets.QLabel("Pose model")
         self.pose_model_combo = QtWidgets.QComboBox()
         for info in list_pose_models():
             self.pose_model_combo.addItem(info.display_name, info.key)
             idx = self.pose_model_combo.count() - 1
             self.pose_model_combo.setItemData(idx, info.description, QtCore.Qt.ItemDataRole.ToolTipRole)
-        depth_layout.addWidget(self.pose_checkbox, 2, 0, 1, 2)
-        depth_layout.addWidget(self.pose_model_label, 3, 0)
-        depth_layout.addWidget(self.pose_model_combo, 3, 1)
-        depth_layout.setColumnStretch(1, 1)
+        pose_layout.addWidget(self.pose_checkbox, 0, 0, 1, 2)
+        pose_layout.addWidget(self.pose_model_label, 1, 0)
+        pose_layout.addWidget(self.pose_model_combo, 1, 1)
+        pose_layout.setColumnStretch(1, 1)
+
+        self.depth_enabled_checkbox = QtWidgets.QCheckBox("Run depth pipeline")
+        self.depth_enabled_checkbox.setChecked(True)
 
         self.use_realsense = QtWidgets.QCheckBox("Use RealSense")
 
@@ -269,8 +278,10 @@ class MainWindow(QtWidgets.QMainWindow):
         file_box.addWidget(QtWidgets.QLabel("Right file"), 1, 0); file_box.addWidget(self.right_file, 1, 1); file_box.addWidget(self.right_browse, 1, 2)
         layout.addLayout(file_box, r, 0, 1, 6); r += 1
 
-        layout.addWidget(QtWidgets.QLabel("Output"), r, 0); layout.addWidget(self.output_mode, r, 1); r += 1
+        layout.addWidget(QtWidgets.QLabel("Output"), r, 0); layout.addWidget(self.output_mode, r, 1)
+        layout.addWidget(self.depth_enabled_checkbox, r, 2, 1, 2); r += 1
         layout.addWidget(self.depth_group, r, 0, 1, 6); r += 1
+        layout.addWidget(self.pose_group, r, 0, 1, 6); r += 1
 
         save_box = QtWidgets.QHBoxLayout()
         save_box.addWidget(QtWidgets.QLabel("Save dir"))
@@ -300,6 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.use_realsense.toggled.connect(self._toggle_realsense_capture)
         self.use_realsense.toggled.connect(self._sync_depth_controls)
         self.pose_checkbox.toggled.connect(self._sync_depth_controls)
+        self.depth_enabled_checkbox.toggled.connect(self._sync_depth_controls)
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
 
@@ -360,7 +372,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return Path(text).expanduser()
 
-    def _maybe_configure_depth_parameters(self) -> None:
+    def _configure_depth_parameters(self) -> None:
+        if not self.depth_enabled_checkbox.isChecked():
+            return
+
         if self.output_mode.currentText() != "Depth":
             return
 
@@ -396,7 +411,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return str(self.left_cam.value()), str(self.right_cam.value()), "stream"
 
-    def _build_session_config(self, engine_path: Path) -> Optional[SessionConfig]:
+    def _build_session_config(self, engine_path: Optional[Path]) -> Optional[SessionConfig]:
         use_realsense = self.use_realsense.isChecked()
         sources = self._determine_sources(use_realsense)
         if sources is None:
@@ -405,15 +420,16 @@ class MainWindow(QtWidgets.QMainWindow):
         left_src, right_src, mode = sources
         session_id = f"gui-{int(time.time())}"
 
-        pose_enabled = (self.output_mode.currentText() == "Depth") and self.pose_checkbox.isChecked()
+        pose_enabled = self.pose_checkbox.isChecked()
         pose_model = (
             self.pose_model_combo.currentData(QtCore.Qt.ItemDataRole.UserRole)
             if pose_enabled
             else None
         )
+        depth_enabled = self.depth_enabled_checkbox.isChecked()
 
         return SessionConfig(
-            engine_path=str(engine_path),
+            engine_path=str(engine_path) if engine_path else None,
             left_src=left_src,
             right_src=right_src,
             mode=mode,
@@ -426,6 +442,7 @@ class MainWindow(QtWidgets.QMainWindow):
             use_realsense=use_realsense,
             pose_enabled=pose_enabled,
             pose_model=pose_model,
+            depth_enabled=depth_enabled
         )
 
     def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
@@ -461,21 +478,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_source_rows()
 
     def _sync_depth_controls(self):
-        is_depth = (self.output_mode.currentText() == "Depth")
-        self.depth_group.setEnabled(is_depth)
+        depth_enabled = self.depth_enabled_checkbox.isChecked()
+        is_depth_mode = depth_enabled and (self.output_mode.currentText() == "Depth")
+        self.output_mode.setEnabled(depth_enabled)
+        self.depth_group.setEnabled(depth_enabled)
         rs = self.use_realsense.isChecked()
-        self.focal_px_edit.setEnabled(is_depth and not rs)
-        self.baseline_m_edit.setEnabled(is_depth and not rs)
-        if not is_depth and self.pose_checkbox.isChecked():
-            self.pose_checkbox.blockSignals(True)
-            self.pose_checkbox.setChecked(False)
-            self.pose_checkbox.blockSignals(False)
-        self.pose_checkbox.setEnabled(is_depth)
-        self.pose_checkbox.setVisible(is_depth)
-        pose_controls_visible = is_depth and self.pose_checkbox.isChecked()
+        self.focal_px_edit.setEnabled(is_depth_mode and not rs)
+        self.baseline_m_edit.setEnabled(is_depth_mode and not rs)
+        pose_controls_visible = self.pose_checkbox.isChecked()
         for w in [self.pose_model_label, self.pose_model_combo]:
             w.setVisible(pose_controls_visible)
             w.setEnabled(pose_controls_visible)
+        self.pose_group.setEnabled(True)
 
     def _show_cameras(self):
         cams = list_cameras()
@@ -528,17 +542,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker is not None:
             self._log("A processing session is already running.")
             return
-        engine_path = self._selected_engine_path()
-        if engine_path is None:
+        depth_enabled = self.depth_enabled_checkbox.isChecked()
+        engine_path: Optional[Path] = None
+        if depth_enabled:
+            engine_path = self._selected_engine_path()
+            if engine_path is None:
+                return
+            try:
+                ensure_tensorrt_runtime()
+            except TensorRTUnavailableError as exc:
+                self._show_message("critical", "TensorRT", str(exc))
+                return
+            self._log(f"[local] Selected TensorRT engine: {engine_path}")
+        elif not self.pose_checkbox.isChecked():
+            self._show_message(
+                "warning",
+                "Configuration",
+                "Enable the depth pipeline or pose estimation before starting.",
+            )
             return
-        try:
-            ensure_tensorrt_runtime()
-        except TensorRTUnavailableError as exc:
-            self._show_message("critical", "TensorRT", str(exc))
-            return
-        self._log(f"[local] Selected TensorRT engine: {engine_path}")
+        else:
+            self._log("[local] Depth pipeline disabled; running pose estimation without TensorRT engine.")
         self.depth_fx, self.depth_baseline_m = None, None
-        self._maybe_configure_depth_parameters()
+        self._configure_depth_parameters()
 
         config = self._build_session_config(engine_path)
         if config is None:

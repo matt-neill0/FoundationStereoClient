@@ -5,7 +5,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 DEFAULT_HEIGHT = 480
 DEFAULT_WIDTH = 640
@@ -28,6 +28,13 @@ def build_arg_parser():
     p.add_argument("--preview", action="store_true", help="Show an OpenCV preview window.")
     p.add_argument("--max-disp", type=float, default=256.0, help="Maximum disparity value used for encoding results.")
     p.add_argument("--disp-scale", type=float, default=256.0, help="Scale factor applied before encoding disparity to PNG16.")
+    p.add_argument("--pose", action="store_true", help="Enable pose estimation output.")
+    p.add_argument("--pose-model", help="Select the pose model to use (e.g. movenet, blazepose).")
+    p.add_argument(
+        "--pose-only",
+        action="store_true",
+        help="Run pose estimation without executing the depth pipeline.",
+    )
     return p
 
 def _resolve_sources(args) -> Tuple[str, str, str]:
@@ -64,26 +71,36 @@ def main_cli(args):
         print(str(exc), file=sys.stderr)
         sys.exit(2)
 
-    if not args.engine:
-        print("--engine is required when running without the GUI.", file=sys.stderr)
-        sys.exit(2)
+    pose_enabled = bool(args.pose or args.pose_model or args.pose_only)
+    pose_model = args.pose_model
+    depth_enabled = not bool(args.pose_only)
+
+    engine_path: Optional[Path] = None
+    if depth_enabled:
+        if not args.engine:
+            print("--engine is required unless --pose-only is specified.", file=sys.stderr)
+            sys.exit(2)
 
     engine_path = Path(args.engine)
     if not engine_path.exists():
         print(f"TensorRT engine not found: {engine_path}", file=sys.stderr)
         sys.exit(2)
 
-    try:
-        ensure_tensorrt_runtime()
-    except TensorRTUnavailableError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+        try:
+            ensure_tensorrt_runtime()
+        except TensorRTUnavailableError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+
+    elif not pose_enabled:
+        print("--pose-only requires --pose or --pose-model to enable pose estimation.", file=sys.stderr)
+        sys.exit(2)
 
     session_id = args.session_id or f"local-{int(time.time())}"
     save_dir = Path(args.save_dir).expanduser() if args.save_dir else None
 
     runner = LocalEngineRunner(
-        engine_path=str(engine_path),
+        engine_path=str(engine_path) if engine_path else None,
         left_src=left_src,
         right_src=right_src,
         mode=mode,
@@ -99,7 +116,10 @@ def main_cli(args):
         on_result=lambda *a: print(
             f"[result] seq={a[0]} kind={a[1]} enc={a[2]} {a[3]}x{a[4]} bytes={len(a[5])}"
         ),
-        use_realsense=bool(args.use_realsense)
+        use_realsense=bool(args.use_realsense),
+        pose_enabled=pose_enabled,
+        pose_model=pose_model,
+        depth_enabled=depth_enabled,
     )
 
     try:

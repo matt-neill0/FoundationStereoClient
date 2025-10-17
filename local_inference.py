@@ -14,7 +14,8 @@ from main import DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH
 from pose_augmentation import (
     get_pose_model_info, lift_keypoints_to_3d,
     depth_guided_nms, get_skeleton_edges,
-    repair_occluded_joints, OcclusionRepairConfig
+    repair_occluded_joints, OcclusionRepairConfig,
+    draw_skeletons
 )
 from pose_backends import PoseBackend, build_pose_backend
 try:
@@ -191,7 +192,7 @@ class LocalEngineRunner:
 
     def __init__(
             self,
-            engine_path: str,
+            engine_path: Optional[str],
             left_src: str,
             right_src: str,
             mode: str,
@@ -214,6 +215,7 @@ class LocalEngineRunner:
             baseline_m: Optional[float] = None,
             pose_enabled: bool = False,
             pose_model: Optional[str] = None,
+            depth_enabled: bool = True
     ) -> None:
         if mode not in {"stream", "file"}:
             raise ValueError("mode must be either 'stream' or 'file'")
@@ -234,6 +236,9 @@ class LocalEngineRunner:
         self._manual_baseline_m = baseline_m
         self.pose_enabled = bool(pose_enabled)
         self.pose_model = pose_model
+        self.depth_enabled = bool(depth_enabled)
+        if self.depth_enabled and not self.engine_path:
+            raise ValueError("engine_path is required when depth inference is enabled")
         self.on_log = on_log or (lambda s: None)
         self.on_result = on_result or (lambda *args: None)
         self.on_start = on_start or (lambda: None)
@@ -304,6 +309,8 @@ class LocalEngineRunner:
             self._log("[pose] Pose estimation enabled without an explicit model key.")
 
     def _prepare_engine(self) -> TensorRTPipeline:
+        if not self.engine_path:
+            raise RuntimeError("Depth inference disabled; no TensorRT engine configured")
         self._log(f"[local] Loading TensorRT engine: {self.engine_path}")
         pipeline = TensorRTPipeline(self.engine_path)
         self._log("[local] TensorRT engine ready.")
@@ -444,11 +451,31 @@ class LocalEngineRunner:
         with open(fname, "wb") as f:
             f.write(png16)
 
-    def _render_preview(self, left_bgr: np.ndarray, disp: np.ndarray, fps: float) -> bool:
+    def _render_preview(
+            self,
+            left_bgr: np.ndarray,
+            disp: Optional[np.ndarray],
+            fps: float,
+            poses_uvc: Optional[List[np.ndarray]] = None,
+    ) -> bool:
         if not self.preview:
             return False
-        disp_color = _normalize_for_display(disp)
-        combo = np.hstack((left_bgr, disp_color))
+        base = left_bgr
+        if poses_uvc:
+            try:
+                base = draw_skeletons(
+                    base,
+                    [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
+                    self._resolved_pose_key or self.pose_model,
+                )
+            except Exception as exc:
+                self._log(f"[pose] Failed to draw preview skeletons: {exc}")
+
+        if disp is not None:
+            disp_color = _normalize_for_display(disp)
+            combo = np.hstack((base, disp_color))
+        else:
+            combo = base
         cv2.putText(
             combo,
             f"{fps:.1f} FPS",
@@ -492,8 +519,9 @@ class LocalEngineRunner:
 
     def run(self) -> None:
         self._stop_event.clear()
-        with push_cuda_context():
-            pipeline = self._prepare_engine()
+        ctx_mgr = push_cuda_context() if self.depth_enabled else contextlib.nullcontext()
+        with ctx_mgr:
+            pipeline = self._prepare_engine() if self.depth_enabled else None
             self.on_start()
             seq = 0
             frame_interval = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.0
@@ -505,10 +533,14 @@ class LocalEngineRunner:
                     left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
 
                     start = time.perf_counter()
-                    disp = pipeline.infer(left_bgr, right_bgr)
-                    fps = 1.0 / max(time.perf_counter() - start, 1e-6)
-
-                    depth_m = self._depth_from_disparity(disp)
+                    disp: Optional[np.ndarray]
+                    depth_m: Optional[np.ndarray]
+                    if pipeline is not None:
+                        disp = pipeline.infer(left_bgr, right_bgr)
+                        depth_m = self._depth_from_disparity(disp)
+                    else:
+                        disp = None
+                        depth_m = None
 
                     # Pose estimation & depth-aware late fusion
                     poses_uvc: List[np.ndarray] = []
@@ -571,11 +603,37 @@ class LocalEngineRunner:
                         pose_meta.append(entry)
                     self._last_pose_meta = pose_meta
 
-                    png16 = self._encode_disparity(disp)
-                    self._emit_result(seq, png16)
-                    self._save_result(seq, png16)
+                    if self.pose_enabled:
+                        if pose_scores:
+                            avg_score = float(np.mean(pose_scores))
+                            best_score = float(np.max(pose_scores))
+                            self._log(
+                                "[pose] seq=%d detections=%d avg_score=%.3f best_score=%.3f"
+                                % (seq, len(pose_scores), avg_score, best_score)
+                            )
+                        else:
+                            self._log(f"[pose] seq={seq} detections=0")
 
-                    if self._render_preview(left_bgr, disp, fps):
+                    if self.pose_enabled:
+                        if pose_scores:
+                            avg_score = float(np.mean(pose_scores))
+                            best_score = float(np.max(pose_scores))
+                            self._log(
+                                "[pose] seq=%d detections=%d avg_score=%.3f best_score=%.3f"
+                                % (seq, len(pose_scores), avg_score, best_score)
+                            )
+                        else:
+                            self._log(f"[pose] seq={seq} detections=0")
+
+                    fps = 1.0 / max(time.perf_counter() - start, 1e-6)
+
+                    if disp is not None:
+                        png16 = self._encode_disparity(disp)
+                        self._emit_result(seq, png16)
+                        self._save_result(seq, png16)
+
+                    preview_poses = poses_uvc if self.pose_enabled else None
+                    if self._render_preview(left_bgr, disp, fps, preview_poses):
                         break
 
                     seq += 1
