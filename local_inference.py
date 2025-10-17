@@ -413,7 +413,7 @@ class LocalEngineRunner:
             self._log(f"[local] Failed to encode disparity: {exc}")
             raise
 
-    def _emit_result(self, seq: int, png16: bytes) -> None:
+    def _emit_disparity_result(self, seq: int, png16: bytes) -> None:
         meta = {
             "session_id": self.session_id,
             "source_mode": self.mode,
@@ -434,6 +434,31 @@ class LocalEngineRunner:
             int(self.frame_width),
             int(self.frame_height),
             png16,
+            meta,
+        )
+
+    def _emit_pose_preview(self, seq: int, frame_bgr: np.ndarray, fps: float) -> None:
+        preview = np.ascontiguousarray(frame_bgr)
+        ok, buf = cv2.imencode(".jpg", preview)
+        if not ok:
+            self._log("[pose] Failed to encode pose preview frame.")
+            return
+
+        meta = {
+            "session_id": self.session_id,
+            "source_mode": self.mode,
+            "sender_wh": [int(self.frame_width), int(self.frame_height)],
+            "pose": self._pose_metadata(),
+            "poses": getattr(self, "_last_pose_meta", []),
+            "fps_est": float(fps),
+        }
+        self.on_result(
+            seq,
+            "pose_preview",
+            "jpg",
+            int(self.frame_width),
+            int(self.frame_height),
+            buf.tobytes(),
             meta,
         )
 
@@ -629,8 +654,10 @@ class LocalEngineRunner:
 
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
-                        self._emit_result(seq, png16)
+                        self._emit_disparity_result(seq, png16)
                         self._save_result(seq, png16)
+                    else:
+                        self._emit_pose_preview(seq, left_bgr, fps)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
                     if self._render_preview(left_bgr, disp, fps, preview_poses):
