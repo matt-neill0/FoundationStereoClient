@@ -413,8 +413,72 @@ class LocalEngineRunner:
             self._log(f"[local] Failed to encode disparity: {exc}")
             raise
 
-    def _emit_result(self, seq: int, png16: bytes) -> None:
-        meta = {
+    def _apply_pose_overlay(
+            self, image_bgr: np.ndarray, poses_uvc: Optional[List[np.ndarray]]
+    ) -> np.ndarray:
+        if not poses_uvc:
+            return image_bgr.copy()
+        try:
+            return draw_skeletons(
+                image_bgr,
+                [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
+                self._resolved_pose_key or self.pose_model,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self._log(f"[pose] Failed to draw preview skeletons: {exc}")
+            return image_bgr.copy()
+
+    def _compose_preview_frame(
+            self,
+            left_bgr: np.ndarray,
+            disp: Optional[np.ndarray],
+            fps: float,
+            poses_uvc: Optional[List[np.ndarray]],
+            preview_bgr: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        base_source = preview_bgr if preview_bgr is not None else left_bgr
+        if base_source.shape[:2] != left_bgr.shape[:2]:
+            base_source = cv2.resize(
+                base_source,
+                (left_bgr.shape[1], left_bgr.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+        base = self._apply_pose_overlay(base_source, poses_uvc)
+        if disp is not None:
+            disp_color = _normalize_for_display(disp)
+            combo = np.hstack((base, disp_color))
+        else:
+            combo = base.copy()
+        cv2.putText(
+            combo,
+            f"{fps:.1f} FPS",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+        )
+        return combo
+
+    def _preview_frame_source(self, fallback: np.ndarray) -> np.ndarray:
+        preview = None
+        if cam is not None:
+            with contextlib.suppress(Exception):
+                preview = cam.get_preview_frame()
+        if preview is None:
+            return fallback
+        if preview.shape[:2] != (self.frame_height, self.frame_width):
+            preview = cv2.resize(
+                preview,
+                (self.frame_width, self.frame_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        if preview.ndim == 2:
+            preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+        return preview
+
+    def _result_metadata(self) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {
             "session_id": self.session_id,
             "source_mode": self.mode,
             "sender_wh": [int(self.frame_width), int(self.frame_height)],
@@ -422,11 +486,15 @@ class LocalEngineRunner:
             "disp_scale": float(self.disp_scale),
             "max_disp": float(self.max_disp),
             "pose": self._pose_metadata(),
-            "poses": getattr(self, "_last_pose_meta", [])
+            "poses": getattr(self, "_last_pose_meta", []),
         }
         if self._use_realsense and self._rs_fx_px is not None and self._rs_baseline_m is not None:
             meta["fx_px"] = float(self._rs_fx_px)
             meta["baseline_m"] = float(self._rs_baseline_m)
+        return meta
+
+    def _emit_result(self, seq: int, png16: bytes, meta: Dict[str, Any]) -> None:
+        payload_meta = dict(meta)
         self.on_result(
             seq,
             "disparity",
@@ -434,7 +502,26 @@ class LocalEngineRunner:
             int(self.frame_width),
             int(self.frame_height),
             png16,
-            meta,
+            payload_meta,
+        )
+
+    def _emit_pose_preview(
+            self, seq: int, preview_bgr: np.ndarray, meta: Dict[str, Any]
+    ) -> None:
+        ok, buf = cv2.imencode(".jpg", preview_bgr)
+        if not ok:
+            self._log("[pose] Failed to encode pose preview frame.")
+            return
+        payload_meta = dict(meta)
+        payload_meta["preview_contains_poses"] = bool(meta.get("poses"))
+        self.on_result(
+            seq,
+            "rgb_preview",
+            "jpg",
+            int(preview_bgr.shape[1]),
+            int(preview_bgr.shape[0]),
+            buf.tobytes(),
+            payload_meta,
         )
 
     def _ensure_save_dir(self) -> None:
@@ -457,33 +544,16 @@ class LocalEngineRunner:
             disp: Optional[np.ndarray],
             fps: float,
             poses_uvc: Optional[List[np.ndarray]] = None,
+            preview_bgr: Optional[np.ndarray] = None,
     ) -> bool:
         if not self.preview:
             return False
-        base = left_bgr
-        if poses_uvc:
-            try:
-                base = draw_skeletons(
-                    base,
-                    [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
-                    self._resolved_pose_key or self.pose_model,
-                )
-            except Exception as exc:
-                self._log(f"[pose] Failed to draw preview skeletons: {exc}")
-
-        if disp is not None:
-            disp_color = _normalize_for_display(disp)
-            combo = np.hstack((base, disp_color))
-        else:
-            combo = base
-        cv2.putText(
-            combo,
-            f"{fps:.1f} FPS",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 0),
-            2,
+        combo = self._compose_preview_frame(
+            left_bgr,
+            disp,
+            fps,
+            poses_uvc,
+            preview_bgr=preview_bgr,
         )
         cv2.imshow("FoundationStereo TensorRT", combo)
         if cv2.waitKey(1) & 0xFF == 27:
@@ -531,6 +601,7 @@ class LocalEngineRunner:
                     if self._stop_event.is_set():
                         break
                     left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
+                    preview_base = self._preview_frame_source(left_bgr)
 
                     start = time.perf_counter()
                     disp: Optional[np.ndarray]
@@ -614,26 +685,33 @@ class LocalEngineRunner:
                         else:
                             self._log(f"[pose] seq={seq} detections=0")
 
-                    if self.pose_enabled:
-                        if pose_scores:
-                            avg_score = float(np.mean(pose_scores))
-                            best_score = float(np.max(pose_scores))
-                            self._log(
-                                "[pose] seq=%d detections=%d avg_score=%.3f best_score=%.3f"
-                                % (seq, len(pose_scores), avg_score, best_score)
-                            )
-                        else:
-                            self._log(f"[pose] seq={seq} detections=0")
-
                     fps = 1.0 / max(time.perf_counter() - start, 1e-6)
+
+                    meta = self._result_metadata()
+
+                    preview_poses = poses_uvc if self.pose_enabled else None
 
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
-                        self._emit_result(seq, png16)
+                        self._emit_result(seq, png16, meta)
                         self._save_result(seq, png16)
+                    else:
+                        preview_frame = self._compose_preview_frame(
+                            left_bgr,
+                            None,
+                            fps,
+                            preview_poses,
+                            preview_bgr=preview_base,
+                        )
+                        self._emit_pose_preview(seq, preview_frame, meta)
 
-                    preview_poses = poses_uvc if self.pose_enabled else None
-                    if self._render_preview(left_bgr, disp, fps, preview_poses):
+                    if self._render_preview(
+                        left_bgr,
+                        disp,
+                        fps,
+                        preview_poses,
+                        preview_bgr=preview_base,
+                    ):
                         break
 
                     seq += 1
