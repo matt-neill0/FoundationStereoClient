@@ -447,7 +447,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
         worker.log_signal.connect(self._log)
-        worker.result_signal.connect(lambda seq, kind, fmt, w, h, payload, meta: self._on_result_image(payload, meta))
+        worker.result_signal.connect(
+            lambda seq, kind, fmt, w, h, payload, meta: self._on_result_image(
+                kind, fmt, w, h, payload, meta
+            )
+        )
         worker.start_signal.connect(self._handle_worker_started)
         worker.finish_signal.connect(self._handle_worker_finished)
 
@@ -649,11 +653,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if img is None:
             return
 
-        vis = img
-        if vis.ndim == 2:
-            vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)
+        if img.ndim == 2:
+            vis_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         else:
-            vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+            vis_bgr = img
+
+        vis_bgr = self._overlay_poses(vis_bgr, meta_payload)
+        vis_rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
         self._set_preview_pixmap(vis_rgb)
 
     def _decode_disparity(self, disp_img: np.ndarray) -> np.ndarray:
