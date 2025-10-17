@@ -413,72 +413,8 @@ class LocalEngineRunner:
             self._log(f"[local] Failed to encode disparity: {exc}")
             raise
 
-    def _apply_pose_overlay(
-            self, image_bgr: np.ndarray, poses_uvc: Optional[List[np.ndarray]]
-    ) -> np.ndarray:
-        if not poses_uvc:
-            return image_bgr.copy()
-        try:
-            return draw_skeletons(
-                image_bgr,
-                [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
-                self._resolved_pose_key or self.pose_model,
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self._log(f"[pose] Failed to draw preview skeletons: {exc}")
-            return image_bgr.copy()
-
-    def _compose_preview_frame(
-            self,
-            left_bgr: np.ndarray,
-            disp: Optional[np.ndarray],
-            fps: float,
-            poses_uvc: Optional[List[np.ndarray]],
-            preview_bgr: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        base_source = preview_bgr if preview_bgr is not None else left_bgr
-        if base_source.shape[:2] != left_bgr.shape[:2]:
-            base_source = cv2.resize(
-                base_source,
-                (left_bgr.shape[1], left_bgr.shape[0]),
-                interpolation=cv2.INTER_AREA,
-            )
-        base = self._apply_pose_overlay(base_source, poses_uvc)
-        if disp is not None:
-            disp_color = _normalize_for_display(disp)
-            combo = np.hstack((base, disp_color))
-        else:
-            combo = base.copy()
-        cv2.putText(
-            combo,
-            f"{fps:.1f} FPS",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 0),
-            2,
-        )
-        return combo
-
-    def _preview_frame_source(self, fallback: np.ndarray) -> np.ndarray:
-        preview = None
-        if cam is not None:
-            with contextlib.suppress(Exception):
-                preview = cam.get_preview_frame()
-        if preview is None:
-            return fallback
-        if preview.shape[:2] != (self.frame_height, self.frame_width):
-            preview = cv2.resize(
-                preview,
-                (self.frame_width, self.frame_height),
-                interpolation=cv2.INTER_AREA,
-            )
-        if preview.ndim == 2:
-            preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
-        return preview
-
-    def _result_metadata(self) -> Dict[str, Any]:
-        meta: Dict[str, Any] = {
+    def _emit_disparity_result(self, seq: int, png16: bytes) -> None:
+        meta = {
             "session_id": self.session_id,
             "source_mode": self.mode,
             "sender_wh": [int(self.frame_width), int(self.frame_height)],
@@ -524,6 +460,31 @@ class LocalEngineRunner:
             payload_meta,
         )
 
+    def _emit_pose_preview(self, seq: int, frame_bgr: np.ndarray, fps: float) -> None:
+        preview = np.ascontiguousarray(frame_bgr)
+        ok, buf = cv2.imencode(".jpg", preview)
+        if not ok:
+            self._log("[pose] Failed to encode pose preview frame.")
+            return
+
+        meta = {
+            "session_id": self.session_id,
+            "source_mode": self.mode,
+            "sender_wh": [int(self.frame_width), int(self.frame_height)],
+            "pose": self._pose_metadata(),
+            "poses": getattr(self, "_last_pose_meta", []),
+            "fps_est": float(fps),
+        }
+        self.on_result(
+            seq,
+            "pose_preview",
+            "jpg",
+            int(self.frame_width),
+            int(self.frame_height),
+            buf.tobytes(),
+            meta,
+        )
+
     def _ensure_save_dir(self) -> None:
         if self.save_dir is None or self._save_dir_prepared:
             return
@@ -548,13 +509,7 @@ class LocalEngineRunner:
     ) -> bool:
         if not self.preview:
             return False
-        combo = self._compose_preview_frame(
-            left_bgr,
-            disp,
-            fps,
-            poses_uvc,
-            preview_bgr=preview_bgr,
-        )
+        combo = self._compose_preview_frame(left_bgr, disp, fps, poses_uvc)
         cv2.imshow("FoundationStereo TensorRT", combo)
         if cv2.waitKey(1) & 0xFF == 27:
             self._log("[local] ESC pressed – stopping preview")
@@ -689,29 +644,15 @@ class LocalEngineRunner:
 
                     meta = self._result_metadata()
 
-                    preview_poses = poses_uvc if self.pose_enabled else None
-
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
-                        self._emit_result(seq, png16, meta)
+                        self._emit_disparity_result(seq, png16)
                         self._save_result(seq, png16)
                     else:
-                        preview_frame = self._compose_preview_frame(
-                            left_bgr,
-                            None,
-                            fps,
-                            preview_poses,
-                            preview_bgr=preview_base,
-                        )
-                        self._emit_pose_preview(seq, preview_frame, meta)
+                        self._emit_pose_preview(seq, left_bgr, fps)
 
-                    if self._render_preview(
-                        left_bgr,
-                        disp,
-                        fps,
-                        preview_poses,
-                        preview_bgr=preview_base,
-                    ):
+                    preview_poses = poses_uvc if self.pose_enabled else None
+                    if self._render_preview(left_bgr, disp, fps, preview_poses):
                         break
 
                     seq += 1
