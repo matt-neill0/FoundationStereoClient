@@ -422,11 +422,15 @@ class LocalEngineRunner:
             "disp_scale": float(self.disp_scale),
             "max_disp": float(self.max_disp),
             "pose": self._pose_metadata(),
-            "poses": getattr(self, "_last_pose_meta", [])
+            "poses": getattr(self, "_last_pose_meta", []),
         }
         if self._use_realsense and self._rs_fx_px is not None and self._rs_baseline_m is not None:
             meta["fx_px"] = float(self._rs_fx_px)
             meta["baseline_m"] = float(self._rs_baseline_m)
+        return meta
+
+    def _emit_result(self, seq: int, png16: bytes, meta: Dict[str, Any]) -> None:
+        payload_meta = dict(meta)
         self.on_result(
             seq,
             "disparity",
@@ -434,7 +438,26 @@ class LocalEngineRunner:
             int(self.frame_width),
             int(self.frame_height),
             png16,
-            meta,
+            payload_meta,
+        )
+
+    def _emit_pose_preview(
+            self, seq: int, preview_bgr: np.ndarray, meta: Dict[str, Any]
+    ) -> None:
+        ok, buf = cv2.imencode(".jpg", preview_bgr)
+        if not ok:
+            self._log("[pose] Failed to encode pose preview frame.")
+            return
+        payload_meta = dict(meta)
+        payload_meta["preview_contains_poses"] = bool(meta.get("poses"))
+        self.on_result(
+            seq,
+            "rgb_preview",
+            "jpg",
+            int(preview_bgr.shape[1]),
+            int(preview_bgr.shape[0]),
+            buf.tobytes(),
+            payload_meta,
         )
 
     def _emit_pose_preview(self, seq: int, frame_bgr: np.ndarray, fps: float) -> None:
@@ -485,31 +508,7 @@ class LocalEngineRunner:
     ) -> bool:
         if not self.preview:
             return False
-        base = left_bgr
-        if poses_uvc:
-            try:
-                base = draw_skeletons(
-                    base,
-                    [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
-                    self._resolved_pose_key or self.pose_model,
-                )
-            except Exception as exc:
-                self._log(f"[pose] Failed to draw preview skeletons: {exc}")
-
-        if disp is not None:
-            disp_color = _normalize_for_display(disp)
-            combo = np.hstack((base, disp_color))
-        else:
-            combo = base
-        cv2.putText(
-            combo,
-            f"{fps:.1f} FPS",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 0),
-            2,
-        )
+        combo = self._compose_preview_frame(left_bgr, disp, fps, poses_uvc)
         cv2.imshow("FoundationStereo TensorRT", combo)
         if cv2.waitKey(1) & 0xFF == 27:
             self._log("[local] ESC pressed – stopping preview")
@@ -651,6 +650,8 @@ class LocalEngineRunner:
                             self._log(f"[pose] seq={seq} detections=0")
 
                     fps = 1.0 / max(time.perf_counter() - start, 1e-6)
+
+                    meta = self._result_metadata()
 
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
