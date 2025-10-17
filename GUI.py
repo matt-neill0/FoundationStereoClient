@@ -447,9 +447,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
         worker.log_signal.connect(self._log)
-        worker.result_signal.connect(lambda seq, kind, fmt, w, h, payload, meta: self._on_result_image(payload, meta))
+        worker.result_signal.connect(self._handle_worker_result)
         worker.start_signal.connect(self._handle_worker_started)
         worker.finish_signal.connect(self._handle_worker_finished)
+
+    def _handle_worker_result(
+            self,
+            seq: int,
+            kind: str,
+            fmt: str,
+            width: int,
+            height: int,
+            payload: bytes,
+            meta: dict,
+    ) -> None:
+        self._on_result_image(kind, fmt, width, height, payload, meta)
 
     def _browse_engine(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -597,6 +609,65 @@ class MainWindow(QtWidgets.QMainWindow):
     def _log(self, msg: str):
         self.log_box.appendPlainText(msg)
 
+    def _update_preview_session(self, meta_payload: dict) -> None:
+        session_id = meta_payload.get("session_id")
+        if session_id is not None:
+            session_str = str(session_id)
+            if session_str != self._disp_preview_session:
+                self._disp_preview_session = session_str
+                self._disp_vis_norm = None
+                self._disp_preview_max = None
+                self._disp_preview_scale = self._disp_preview_default_scale
+
+    def _update_disparity_metadata(self, meta_payload: dict) -> None:
+        scale_val = self._coerce_float(meta_payload.get("disp_scale"))
+        if scale_val is not None and scale_val > 0:
+            self._disp_preview_scale = scale_val
+        elif self._disp_preview_scale is None or self._disp_preview_scale <= 0:
+            self._disp_preview_scale = self._disp_preview_default_scale
+
+        max_val = self._coerce_float(meta_payload.get("max_disp"))
+        if max_val is not None and max_val > 0:
+            self._disp_preview_max = max_val
+
+        if self.use_realsense.isChecked():
+            fx_px = self._coerce_float(meta_payload.get("fx_px"))
+            bl_m = self._coerce_float(meta_payload.get("baseline_m"))
+            if fx_px and bl_m and (self.depth_fx is None or self.depth_baseline_m is None):
+                self.depth_fx, self.depth_baseline_m = fx_px, bl_m
+                self._log(
+                    f"[depth] RealSense calibration received: fx={fx_px:.2f}, baseline={bl_m:.6f} m"
+                )
+
+    def _set_preview_pixmap(self, vis_rgb: np.ndarray) -> None:
+        hq, wq = vis_rgb.shape[:2]
+        qimg = QtGui.QImage(
+            vis_rgb.data,
+            wq,
+            hq,
+            vis_rgb.strides[0],
+            QtGui.QImage.Format.Format_RGB888,
+        )
+        pix = QtGui.QPixmap.fromImage(qimg).scaled(
+            self.preview_label.size(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(pix)
+
+    def _display_rgb_preview(self, fmt: str, payload: bytes, meta_payload: dict) -> None:
+        arr = np.frombuffer(payload, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return
+
+        vis = img
+        if vis.ndim == 2:
+            vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)
+        else:
+            vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        self._set_preview_pixmap(vis_rgb)
+
     def _decode_disparity(self, disp_img: np.ndarray) -> np.ndarray:
         disp = disp_img.astype(np.float32)
         if disp_img.dtype == np.uint16:
@@ -713,38 +784,31 @@ class MainWindow(QtWidgets.QMainWindow):
         vis = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
         return vis
 
-    def _on_result_image(self, payload: bytes, meta: dict):
+    def _on_result_image(
+            self,
+            kind: str,
+            fmt: str,
+            width: int,
+            height: int,
+            payload: bytes,
+            meta: dict,
+    ) -> None:
+        meta_payload: dict = meta if isinstance(meta, dict) else {}
+        self._update_preview_session(meta_payload)
+
+        if kind == "rgb_preview":
+            self._display_rgb_preview(fmt, payload, meta_payload)
+            return
+
+        if kind != "disparity":
+            return
+
         arr = np.frombuffer(payload, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
         if img is None:
             return
 
-        meta_payload: dict = meta if isinstance(meta, dict) else {}
-        session_id = meta_payload.get("session_id")
-        if session_id is not None:
-            session_str = str(session_id)
-            if session_str != self._disp_preview_session:
-                self._disp_preview_session = session_str
-                self._disp_vis_norm = None
-                self._disp_preview_max = None
-                self._disp_preview_scale = self._disp_preview_default_scale
-
-        scale_val = self._coerce_float(meta_payload.get("disp_scale"))
-        if scale_val is not None and scale_val > 0:
-            self._disp_preview_scale = scale_val
-        elif self._disp_preview_scale is None or self._disp_preview_scale <= 0:
-            self._disp_preview_scale = self._disp_preview_default_scale
-
-        max_val = self._coerce_float(meta_payload.get("max_disp"))
-        if max_val is not None and max_val > 0:
-            self._disp_preview_max = max_val
-
-        if self.use_realsense.isChecked():
-            fx_px = self._coerce_float(meta_payload.get("fx_px"))
-            bl_m = self._coerce_float(meta_payload.get("baseline_m"))
-            if fx_px and bl_m and (self.depth_fx is None or self.depth_baseline_m is None):
-                self.depth_fx, self.depth_baseline_m = fx_px, bl_m
-                self._log(f"[depth] RealSense calibration received: fx={fx_px:.2f}, baseline={bl_m:.6f} m")
+        self._update_disparity_metadata(meta_payload)
 
         want_depth = (self.output_mode.currentText() == "Depth")
         disparity = self._decode_disparity(img)
@@ -754,17 +818,13 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             vis = self._visualize_disparity(disparity)
 
-        # Overlay poses if provided in meta
         vis = self._overlay_poses(vis, meta_payload)
 
         if vis.ndim == 2:
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)
         else:
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-        hq, wq = vis_rgb.shape[:2]
-        qimg = QtGui.QImage(vis_rgb.data, wq, hq, vis_rgb.strides[0], QtGui.QImage.Format.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio,QtCore.Qt.TransformationMode.SmoothTransformation)
-        self.preview_label.setPixmap(pix)
+        self._set_preview_pixmap(vis_rgb)
 
 def launch_gui():
     app = QtWidgets.QApplication([])
