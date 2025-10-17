@@ -505,6 +505,7 @@ class LocalEngineRunner:
             disp: Optional[np.ndarray],
             fps: float,
             poses_uvc: Optional[List[np.ndarray]] = None,
+            preview_bgr: Optional[np.ndarray] = None,
     ) -> bool:
         if not self.preview:
             return False
@@ -555,6 +556,7 @@ class LocalEngineRunner:
                     if self._stop_event.is_set():
                         break
                     left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
+                    preview_base = self._preview_frame_source(left_bgr)
 
                     start = time.perf_counter()
                     disp: Optional[np.ndarray]
@@ -626,17 +628,6 @@ class LocalEngineRunner:
                             entry["keypoints_xyz"] = np.asarray(xyz, dtype=np.float32).tolist()
                         pose_meta.append(entry)
                     self._last_pose_meta = pose_meta
-
-                    if self.pose_enabled:
-                        if pose_scores:
-                            avg_score = float(np.mean(pose_scores))
-                            best_score = float(np.max(pose_scores))
-                            self._log(
-                                "[pose] seq=%d detections=%d avg_score=%.3f best_score=%.3f"
-                                % (seq, len(pose_scores), avg_score, best_score)
-                            )
-                        else:
-                            self._log(f"[pose] seq={seq} detections=0")
 
                     if self.pose_enabled:
                         if pose_scores:
