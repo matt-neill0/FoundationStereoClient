@@ -406,6 +406,24 @@ class LocalEngineRunner:
 
         return left_bgr, right_bgr
 
+    def _realsense_preview_frame(self) -> Optional[np.ndarray]:
+        if not self._use_realsense or cam is None:
+            return None
+
+        preview = cam.get_preview_frame()
+        if preview is None:
+            return None
+
+        preview_r = self._resize_frame(preview)
+        if preview_r.ndim == 2:
+            return cv2.cvtColor(preview_r, cv2.COLOR_GRAY2BGR)
+        if preview_r.ndim == 3:
+            if preview_r.shape[2] == 3:
+                return preview_r
+            if preview_r.shape[2] > 3:
+                return preview_r[:, :, :3]
+        return None
+
     def _encode_disparity(self, disp: np.ndarray) -> bytes:
         try:
             return disparity_to_png16(disp, self.max_disp, self.disp_scale)
@@ -657,15 +675,17 @@ class LocalEngineRunner:
 
                     fps = 1.0 / max(time.perf_counter() - start, 1e-6)
 
+                    preview_base = self._realsense_preview_frame() or left_bgr
+
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
                         self._emit_result(seq, png16)
                         self._save_result(seq, png16)
                     else:
-                        self._emit_rgb_preview(seq, left_bgr)
+                        self._emit_rgb_preview(seq, preview_base)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
-                    preview_frame = self._apply_pose_overlay(left_bgr, preview_poses)
+                    preview_frame = self._apply_pose_overlay(preview_base, preview_poses)
 
                     if disp is None:
                         self._emit_rgb_preview(seq, preview_frame)
