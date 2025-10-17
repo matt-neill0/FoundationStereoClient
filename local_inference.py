@@ -256,6 +256,7 @@ class LocalEngineRunner:
             str(self.pose_model).lower() if self.pose_model else None
         )
         self._last_pose_meta: List[Dict[str, Any]] = []
+        self._latest_preview_bgr: Optional[np.ndarray] = None
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
         if override is not None:
@@ -579,6 +580,7 @@ class LocalEngineRunner:
                     if self._stop_event.is_set():
                         break
                     left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
+                    preview_source = self._select_preview_frame(left_bgr)
 
                     start = time.perf_counter()
                     disp: Optional[np.ndarray]
@@ -598,7 +600,7 @@ class LocalEngineRunner:
                             self._pose_runner = self._init_pose_backend()
                         if self._pose_runner is not None:
                             try:
-                                poses_uvc, pose_scores = self._pose_runner(left_bgr, depth_m)
+                                poses_uvc, pose_scores = self._pose_runner(preview_source, depth_m)
                             except Exception as exc:
                                 self._log(f"[pose] backend failed: {exc}")
                     if poses_uvc and depth_m is not None:
