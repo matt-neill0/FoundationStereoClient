@@ -113,6 +113,11 @@ def capture_realsense() -> None:
                 color = frames.get_color_frame() if color_enabled else None
                 if not ir_l or not ir_r:
                     continue
+                color_frame = None
+                with contextlib.suppress(Exception):
+                    color = frames.get_color_frame()
+                    if color:
+                        color_frame = np.asanyarray(color.get_data()).copy()
                 with _lock:
                     _frame1 = np.asanyarray(ir_l.get_data())
                     _frame2 = np.asanyarray(ir_r.get_data())

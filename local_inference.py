@@ -256,6 +256,7 @@ class LocalEngineRunner:
             str(self.pose_model).lower() if self.pose_model else None
         )
         self._last_pose_meta: List[Dict[str, Any]] = []
+        self._last_color_preview: Optional[np.ndarray] = None
 
     def _determine_realsense_flag(self, override: Optional[bool]) -> bool:
         if override is not None:
@@ -516,6 +517,26 @@ class LocalEngineRunner:
             return True
         return False
 
+    def _latest_color_preview(self) -> Optional[np.ndarray]:
+        if not self._use_realsense or cam is None:
+            return None
+        getter = getattr(cam, "get_color_frame", None)
+        if getter is None:
+            return None
+        frame = getter()
+        if frame is None:
+            return None
+        self._last_color_preview = frame
+        return frame
+
+    def _preview_display_frame(self, left_bgr: np.ndarray) -> np.ndarray:
+        color = self._latest_color_preview()
+        if color is not None:
+            return self._resize_frame(color)
+        if self._last_color_preview is not None:
+            return self._resize_frame(self._last_color_preview)
+        return left_bgr
+
     def _respect_frame_rate(self, next_deadline: float, interval: float) -> float:
         next_deadline += interval
         sleep_s = next_deadline - time.perf_counter()
@@ -541,6 +562,7 @@ class LocalEngineRunner:
         if self.preview:
             cv2.destroyAllWindows()
         self._stop_capture_threads()
+        self._last_color_preview = None
 
     def run(self) -> None:
         self._stop_event.clear()
@@ -652,7 +674,13 @@ class LocalEngineRunner:
                         self._emit_pose_preview(seq, left_bgr, fps)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
-                    if self._render_preview(left_bgr, disp, fps, preview_poses):
+                    if self._render_preview(
+                        left_bgr,
+                        disp,
+                        fps,
+                        preview_poses,
+                        display_bgr=display_frame,
+                    ):
                         break
 
                     seq += 1
