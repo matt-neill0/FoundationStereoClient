@@ -425,6 +425,26 @@ class LocalEngineRunner:
                 return preview_r[:, :, :3]
         return None
 
+    def _select_preview_frame(self, left_bgr: np.ndarray) -> np.ndarray:
+        """Choose the RGB frame that should be used for pose estimation.
+
+        If a RealSense preview frame is available we favour that, otherwise we
+        fall back to the rectified left image. The selected frame is cached so
+        that subsequent consumers (e.g. pose backends) always receive a valid
+        array even when the RealSense preview momentarily drops a frame.
+        """
+
+        preview = self._realsense_preview_frame()
+
+        if preview is None:
+            if self._use_realsense and self._latest_preview_bgr is not None:
+                preview = self._latest_preview_bgr
+            else:
+                preview = left_bgr
+
+        self._latest_preview_bgr = preview
+        return preview
+
     def _encode_disparity(self, disp: np.ndarray) -> bytes:
         try:
             return disparity_to_png16(disp, self.max_disp, self.disp_scale)
@@ -580,7 +600,7 @@ class LocalEngineRunner:
                     if self._stop_event.is_set():
                         break
                     left_bgr, right_bgr = self._prepare_pair(left_raw, right_raw)
-                    preview_source = self._select_preview_frame(left_bgr)
+        preview_source = self._select_preview_frame(left_bgr)
 
                     start = time.perf_counter()
                     disp: Optional[np.ndarray]
