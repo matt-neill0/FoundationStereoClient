@@ -320,7 +320,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._disp_preview_max: Optional[float] = None
         self._disp_preview_session: Optional[str] = None
         self._disp_vis_norm: Optional[float] = None
-        self._preview_buffer: Optional[np.ndarray] = None
 
     def _show_message(self, level: str, title: str, text: str) -> None:
         handlers = {
@@ -448,20 +447,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _attach_worker_signals(self, worker: LocalEngineWorker) -> None:
         worker.log_signal.connect(self._log)
-        worker.result_signal.connect(self._handle_worker_result)
+        worker.result_signal.connect(lambda seq, kind, fmt, w, h, payload, meta: self._on_result_image(payload, meta))
         worker.start_signal.connect(self._handle_worker_started)
         worker.finish_signal.connect(self._handle_worker_finished)
-
-    def _handle_worker_result(self, seq: int, kind: str, fmt: str, width: int, height: int, payload: bytes, meta: dict) -> None:
-        kind = (kind or "").lower()
-        if kind == "pose_preview":
-            self._on_pose_preview(payload, meta)
-            return
-        if kind == "disparity":
-            self._on_result_image(payload, meta)
-            return
-        # Fallback: try to interpret as a generic colour frame
-        self._on_pose_preview(payload, meta)
 
     def _browse_engine(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -744,59 +732,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return out
 
 
-    def _update_preview_pixmap(self, vis_rgb: np.ndarray) -> None:
-        if vis_rgb.ndim == 2:
-            vis_rgb = np.stack([vis_rgb] * 3, axis=-1)
-        vis_rgb = np.ascontiguousarray(vis_rgb)
-        self._preview_buffer = vis_rgb
-        hq, wq = vis_rgb.shape[:2]
-        qimg = QtGui.QImage(
-            vis_rgb.data,
-            wq,
-            hq,
-            vis_rgb.strides[0],
-            QtGui.QImage.Format.Format_RGB888,
-        )
-        pix = QtGui.QPixmap.fromImage(qimg).scaled(
-            self.preview_label.size(),
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-            QtCore.Qt.TransformationMode.SmoothTransformation,
-        )
-        self.preview_label.setPixmap(pix)
-
-
-    def _on_pose_preview(self, payload: bytes, meta: dict) -> None:
-        arr = np.frombuffer(payload, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return
-
-        meta_payload: dict = meta if isinstance(meta, dict) else {}
-        session_id = meta_payload.get("session_id")
-        if session_id is not None:
-            session_str = str(session_id)
-            if session_str != self._disp_preview_session:
-                self._disp_preview_session = session_str
-                self._disp_vis_norm = None
-                self._disp_preview_max = None
-                self._disp_preview_scale = self._disp_preview_default_scale
-
-        vis = self._overlay_poses(img, meta_payload)
-        fps_est = self._coerce_float(meta_payload.get("fps_est"))
-        if fps_est is not None and fps_est > 0:
-            cv2.putText(
-                vis,
-                f"{fps_est:.1f} FPS",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 255, 0),
-                2,
-            )
-        vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-        self._update_preview_pixmap(vis_rgb)
-
-
     def _visualize_disparity(self, disparity: np.ndarray) -> np.ndarray:
         disp = np.nan_to_num(disparity.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         if self._disp_preview_max is not None:
@@ -877,7 +812,10 @@ class MainWindow(QtWidgets.QMainWindow):
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_GRAY2RGB)
         else:
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-        self._update_preview_pixmap(vis_rgb)
+        hq, wq = vis_rgb.shape[:2]
+        qimg = QtGui.QImage(vis_rgb.data, wq, hq, vis_rgb.strides[0], QtGui.QImage.Format.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio,QtCore.Qt.TransformationMode.SmoothTransformation)
+        self.preview_label.setPixmap(pix)
 
 def launch_gui():
     app = QtWidgets.QApplication([])
