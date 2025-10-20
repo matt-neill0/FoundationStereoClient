@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 
 from pose_backends import PoseBackend, build_pose_backend
-from pose_augmentation import get_pose_model_info
+from pose_augmentation import draw_skeletons, get_pose_model_info
 
 try:  # SciPy is optional; fall back to a greedy matcher if unavailable.
     from scipy.optimize import linear_sum_assignment  # type: ignore
@@ -72,6 +72,12 @@ PANOPTIC_COCO19_TO_COCO17 = [
     13,  # left_ankle
     10,  # right_ankle
 ]
+
+
+PREDICTION_JOINT_COLOR = (0, 255, 0)
+PREDICTION_LIMB_COLOR = (255, 200, 0)
+GROUND_TRUTH_JOINT_COLOR = (0, 0, 255)
+GROUND_TRUTH_LIMB_COLOR = (0, 0, 255)
 
 
 @dataclass
@@ -202,12 +208,80 @@ class PoseSample:
     visibility: np.ndarray  # shape (17,) with {0,1}
 
 
+def _project_camera_coordinates(camera: PanopticCamera, xyz_camera: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Project XYZ already expressed in the camera reference frame."""
+
+    pts = np.asarray(xyz_camera, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError("xyz_camera must be shaped (N,3[+])")
+    if pts.shape[0] == 0:
+        return (
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+
+    projected, _ = cv2.projectPoints(
+        np.ascontiguousarray(pts[:, :3], dtype=np.float64).reshape(-1, 1, 3),
+        np.zeros((3, 1), dtype=np.float64),
+        np.zeros((3, 1), dtype=np.float64),
+        camera._K,
+        camera._dist,
+    )
+
+    uv = projected.reshape(-1, 2)
+    depth = pts[:, 2]
+    return uv.astype(np.float32), depth.astype(np.float32)
+
+
+def _score_projection(uv: np.ndarray, depth: np.ndarray, width: int, height: int) -> int:
+    if uv.size == 0 or depth.size == 0:
+        return 0
+    valid = (
+        np.isfinite(uv[:, 0])
+        & np.isfinite(uv[:, 1])
+        & np.isfinite(depth)
+        & (depth > 0)
+        & (uv[:, 0] >= 0)
+        & (uv[:, 0] < width)
+        & (uv[:, 1] >= 0)
+        & (uv[:, 1] < height)
+    )
+    return int(np.count_nonzero(valid))
+
+
+def _pose_sample_to_uvc(sample: PoseSample) -> np.ndarray:
+    keypoints = np.asarray(sample.keypoints_uv, dtype=np.float32)
+    conf = sample.visibility.astype(np.float32).reshape(-1, 1)
+    if keypoints.ndim != 2 or keypoints.shape[1] < 2:
+        raise ValueError("PoseSample keypoints must be shaped (K, 2)")
+    return np.concatenate([keypoints[:, :2], conf], axis=1)
+
+
+def _normalise_pose_uvc(pose: np.ndarray) -> Optional[np.ndarray]:
+    arr = np.asarray(pose, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return None
+    if arr.shape[1] == 2:
+        conf = np.ones((arr.shape[0], 1), dtype=np.float32)
+        return np.concatenate([arr[:, :2], conf], axis=1)
+    return arr[:, :3].astype(np.float32, copy=True)
+
+
 def _body_to_pose_sample(body: dict, camera: PanopticCamera) -> PoseSample:
     joints = np.asarray(body.get("joints19", []), dtype=np.float32).reshape(-1, 4)
     if joints.size == 0:
         return PoseSample(np.full((17, 2), np.nan, dtype=np.float32), np.zeros((17,), dtype=np.uint8))
 
-    uv, _depth = camera.project(joints[:, :3])
+    uv_world, depth_world = camera.project(joints[:, :3])
+    uv_camera, depth_camera = _project_camera_coordinates(camera, joints[:, :3])
+
+    score_world = _score_projection(uv_world, depth_world, camera.width, camera.height)
+    score_camera = _score_projection(uv_camera, depth_camera, camera.width, camera.height)
+
+    if score_camera > score_world:
+        uv = uv_camera
+    else:
+        uv = uv_world
     conf = joints[:, 3]
 
     keypoints = np.full((17, 2), np.nan, dtype=np.float32)
@@ -383,9 +457,16 @@ def evaluate_sequence(
     pck_threshold: float,
     disparity_engine: Optional[TensorRTPipeline],
     on_log,
+    pose_model_key: Optional[str] = None,
+    visualise_dir: Optional[Path] = None,
 ) -> Metrics:
     calib_path = dataset_root / f"calibration_{dataset_root.name}.json"
     cameras = load_panoptic_calibration(calib_path)
+
+    vis_dir = visualise_dir
+    if vis_dir is not None:
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        on_log(f"[info] Saving pose visualisations to {vis_dir}")
 
     def resolve_camera(name: str) -> PanopticCamera:
         key = _normalise_camera_key(name)
@@ -468,12 +549,12 @@ def evaluate_sequence(
         left_path = left_frames[frame_idx]
         right_path = right_frames[frame_idx] if right_cam is not None else None
 
-        left_img = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
-        if left_img is None:
+        left_img_native = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
+        if left_img_native is None:
             on_log(f"[warn] Failed to read {left_path}; skipping frame")
             continue
-        native_h, native_w = left_img.shape[:2]
-        left_img = _resize_if_needed(left_img, frame_width, frame_height)
+        native_h, native_w = left_img_native.shape[:2]
+        left_img = _resize_if_needed(left_img_native, frame_width, frame_height)
         resized_h, resized_w = left_img.shape[:2]
         scale_x = native_w / float(resized_w) if resized_w else 1.0
         scale_y = native_h / float(resized_h) if resized_h else 1.0
@@ -485,11 +566,11 @@ def evaluate_sequence(
             and baseline_m is not None
             and fx_px is not None
         ):
-            right_img = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
-            if right_img is None:
+            right_img_native = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
+            if right_img_native is None:
                 on_log(f"[warn] Failed to read {right_path}; skipping disparity")
             else:
-                right_img = _resize_if_needed(right_img, frame_width, frame_height)
+                right_img = _resize_if_needed(right_img_native, frame_width, frame_height)
                 disp = disparity_engine.infer(left_img, right_img)
                 if disp is not None:
                     depth_map = _depth_from_disparity(disp, fx_px, baseline_m)
@@ -548,6 +629,54 @@ def evaluate_sequence(
 
         metrics.false_positives += max(len(poses) - len(matched_preds), 0)
 
+        if vis_dir is not None:
+            pred_uvc: List[np.ndarray] = []
+            for pose in poses:
+                arr = _normalise_pose_uvc(pose)
+                if arr is not None:
+                    pred_uvc.append(arr)
+            gt_uvc = [_pose_sample_to_uvc(gt_pose) for gt_pose in gt_poses]
+            if pred_uvc or gt_uvc:
+                vis_image = left_img_native.copy()
+                if pred_uvc:
+                    vis_image = draw_skeletons(
+                        vis_image,
+                        pred_uvc,
+                        pose_model_key,
+                        joint_color=PREDICTION_JOINT_COLOR,
+                        limb_color=PREDICTION_LIMB_COLOR,
+                    )
+                if gt_uvc:
+                    vis_image = draw_skeletons(
+                        vis_image,
+                        gt_uvc,
+                        pose_model_key,
+                        joint_color=GROUND_TRUTH_JOINT_COLOR,
+                        limb_color=GROUND_TRUTH_LIMB_COLOR,
+                    )
+
+                legend_entries: List[Tuple[str, Tuple[int, int, int]]] = []
+                if pred_uvc:
+                    legend_entries.append(("Prediction", PREDICTION_JOINT_COLOR))
+                if gt_uvc:
+                    legend_entries.append(("Ground truth", GROUND_TRUTH_JOINT_COLOR))
+                for line_idx, (label, colour) in enumerate(legend_entries):
+                    origin = (10, 30 + line_idx * 25)
+                    cv2.putText(
+                        vis_image,
+                        label,
+                        origin,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        colour,
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                vis_path = vis_dir / f"{frame_id}.jpg"
+                if not cv2.imwrite(str(vis_path), vis_image):
+                    on_log(f"[warn] Failed to write visualisation to {vis_path}")
+
         if idx_pos and idx_pos % 50 == 0:
             summary = metrics.summary()
             on_log(
@@ -603,6 +732,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="PCK threshold as a fraction of the larger evaluation image dimension.",
     )
     parser.add_argument("--disparity-engine", type=Path, help="Optional TensorRT engine for disparity estimation.")
+    parser.add_argument(
+        "--visualise-dir",
+        type=Path,
+        help="Directory where per-frame pose overlays (prediction vs. ground truth) will be saved.",
+    )
     return parser.parse_args(argv)
 
 
@@ -617,7 +751,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("[error] Failed to initialise the requested pose backend.")
         return 1
 
-    info = get_pose_model_info(resolved_key or args.pose_model)
+    model_key = resolved_key or args.pose_model
+    info = get_pose_model_info(model_key)
     if info is not None:
         log(f"[info] Using pose backend: {info.display_name} ({info.key})")
 
@@ -638,6 +773,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pck_threshold=float(args.pck_threshold),
         disparity_engine=disparity_engine,
         on_log=log,
+        pose_model_key=model_key,
+        visualise_dir=args.visualise_dir,
     )
 
     summary = metrics.summary()
