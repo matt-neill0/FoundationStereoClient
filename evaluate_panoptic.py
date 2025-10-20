@@ -83,6 +83,25 @@ class PanopticCamera:
     dist: np.ndarray
     resolution: Tuple[int, int]
 
+    def __post_init__(self) -> None:
+        # Normalise calibration arrays so downstream code can assume contiguous
+        # float data.  ``cv2.projectPoints`` is strict about dtypes and rejects
+        # anything other than 32/64-bit floats, so pre-convert here.
+        self.K = np.ascontiguousarray(np.asarray(self.K, dtype=np.float32).reshape(3, 3))
+        self.R = np.ascontiguousarray(np.asarray(self.R, dtype=np.float32).reshape(3, 3))
+        self.t = np.ascontiguousarray(np.asarray(self.t, dtype=np.float32).reshape(3, 1))
+        self.dist = np.ascontiguousarray(np.asarray(self.dist, dtype=np.float32).reshape(-1))
+
+        # Cache float64 views for the OpenCV projection helper.
+        R64 = self.R.astype(np.float64)
+        self._R = R64
+        self._t = self.t.astype(np.float64)
+        self._K = self.K.astype(np.float64)
+        self._dist = None if self.dist.size == 0 else self.dist.astype(np.float64).reshape(1, -1)
+        rvec, _ = cv2.Rodrigues(R64)
+        self._rvec = np.ascontiguousarray(rvec)
+        self._tvec = np.ascontiguousarray(self._t.reshape(3, 1))
+
     @property
     def width(self) -> int:
         return int(self.resolution[0])
@@ -94,24 +113,38 @@ class PanopticCamera:
     def project(self, xyz_world: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Project XYZ world coordinates (in millimetres) into image pixels."""
 
-        if xyz_world.ndim != 2 or xyz_world.shape[1] < 3:
+        xyz = np.asarray(xyz_world, dtype=np.float64)
+
+        if xyz.ndim != 2 or xyz.shape[1] < 3:
             raise ValueError("xyz_world must be shaped (N,3[+])")
 
-        pts = xyz_world[:, :3].T  # 3 x N
-        R = self.R.reshape(3, 3)
-        t = self.t.reshape(3, 1)
-        cam = R @ pts + t  # camera coordinates
-        z = cam[2:3, :]
+        if xyz.shape[0] == 0:
+            return (
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        pts = np.ascontiguousarray(xyz[:, :3], dtype=np.float64)
+        cam = self._R @ pts.T + self._t  # camera coordinates
+        z = cam[2, :]
         eps = 1e-6
         valid = z > eps
-        P = self.K.reshape(3, 3)
-        pix = P @ cam
-        pix /= np.maximum(z, eps)
-        uv = pix[:2, :].T
-        depth = cam[2, :]
-        uv[~valid.ravel(), :] = np.nan
-        depth[~valid.ravel()] = np.nan
-        return uv, depth
+
+        projected, _ = cv2.projectPoints(
+            pts.reshape(-1, 1, 3),
+            self._rvec,
+            self._tvec,
+            self._K,
+            self._dist,
+        )
+
+        uv = projected.reshape(-1, 2)
+        uv[~valid, :] = np.nan
+
+        depth = z.copy()
+        depth[~valid] = np.nan
+
+        return uv.astype(np.float32), depth.astype(np.float32)
 
 
 def _normalise_camera_key(name: str) -> str:
