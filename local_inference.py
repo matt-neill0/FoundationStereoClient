@@ -99,6 +99,9 @@ class _Binding:
     host_mem: Optional[np.ndarray]
     device_mem: Optional[Any]
 
+    def update_shape(self, shape: Tuple[int, ...]) -> None:
+        object.__setattr__(self, "shape", shape)
+
 class TensorRTPipeline:
     """Small helper around TensorRT execution based on the live TRT demo script."""
 
@@ -168,6 +171,12 @@ class TensorRTPipeline:
         cuda = self.cuda
         stream = self.stream
 
+        self._ensure_input_binding(self.input_left, left)
+        self._ensure_input_binding(self.input_right, right)
+
+        output_shape = tuple(self.context.get_tensor_shape(self.output))
+        self._ensure_output_binding(self.output, output_shape)
+
         cuda.memcpy_htod_async(self.bindings[self.input_left].device_mem, left, stream)
         cuda.memcpy_htod_async(self.bindings[self.input_right].device_mem, right, stream)
 
@@ -179,6 +188,34 @@ class TensorRTPipeline:
         stream.synchronize()
 
         return np.array(out_binding.host_mem, copy=True).squeeze()
+
+    def _ensure_input_binding(self, name: str, array: np.ndarray) -> None:
+        binding = self.bindings[name]
+        if array.dtype != binding.dtype:
+            raise TypeError(
+                f"Input tensor '{name}' expects dtype {binding.dtype}, received {array.dtype}"
+            )
+        desired_shape = tuple(array.shape)
+        self.context.set_input_shape(name, list(desired_shape))
+        if binding.shape != desired_shape or binding.device_mem is None:
+            size_bytes = array.nbytes
+            binding.device_mem = self.cuda.mem_alloc(size_bytes)
+            binding.update_shape(desired_shape)
+        self.context.set_tensor_address(name, int(binding.device_mem))
+
+    def _ensure_output_binding(self, name: str, shape: Tuple[int, ...]) -> None:
+        binding = self.bindings[name]
+        if any(dim < 0 for dim in shape):
+            raise RuntimeError(
+                f"Output tensor '{name}' has unresolved dimension(s): {shape}."
+            )
+        if binding.shape != shape or binding.device_mem is None:
+            size_bytes = int(np.prod(shape)) * binding.dtype.itemsize
+            binding.device_mem = self.cuda.mem_alloc(size_bytes)
+            binding.update_shape(shape)
+        self.context.set_tensor_address(name, int(binding.device_mem))
+        if binding.host_mem is None or binding.host_mem.shape != shape:
+            binding.host_mem = self.cuda.pagelocked_empty(shape, binding.dtype)
 
 def _normalize_for_display(disp: np.ndarray) -> np.ndarray:
     disp_min, disp_max = float(np.min(disp)), float(np.max(disp))
