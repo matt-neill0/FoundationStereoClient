@@ -48,29 +48,29 @@ except Exception:  # pragma: no cover - TensorRT not installed
     TensorRTPipeline = None  # type: ignore
     TensorRTUnavailableError = RuntimeError  # type: ignore
 
-# Mapping from CMU Panoptic "COCO19" joint indices to COCO-17 order expected by
-# the Foundation pose backends.  The Panoptic labels are::
-#   0:Neck 1:Nose 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
-#   7:LWrist 8:RHip 9:RKnee 10:RAnkle 11:LHip 12:LKnee 13:LAnkle
-#   14:REye 15:LEye 16:REar 17:LEar 18:Chest
+# Mapping from CMU Panoptic "COCO19" joint indices to the COCO-17 order expected
+# by the Foundation pose backends.  The Panoptic labels use left-first ordering::
+#   0:Neck 1:Nose 2:LShoulder 3:LElbow 4:LWrist 5:RShoulder 6:RElbow
+#   7:RWrist 8:LHip 9:LKnee 10:LAnkle 11:RHip 12:RKnee 13:RAnkle
+#   14:LEye 15:REye 16:LEar 17:REar 18:Chest
 PANOPTIC_COCO19_TO_COCO17 = [
     1,   # nose
-    15,  # left_eye
-    14,  # right_eye
-    17,  # left_ear
-    16,  # right_ear
-    5,   # left_shoulder
-    2,   # right_shoulder
-    6,   # left_elbow
-    3,   # right_elbow
-    7,   # left_wrist
-    4,   # right_wrist
-    11,  # left_hip
-    8,   # right_hip
-    12,  # left_knee
-    9,   # right_knee
-    13,  # left_ankle
-    10,  # right_ankle
+    14,  # left_eye
+    15,  # right_eye
+    16,  # left_ear
+    17,  # right_ear
+    2,   # left_shoulder
+    5,   # right_shoulder
+    3,   # left_elbow
+    6,   # right_elbow
+    4,   # left_wrist
+    7,   # right_wrist
+    8,   # left_hip
+    11,  # right_hip
+    9,   # left_knee
+    12,  # right_knee
+    10,  # left_ankle
+    13,  # right_ankle
 ]
 
 
