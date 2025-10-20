@@ -9,6 +9,7 @@ confidence score per pose.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
@@ -179,20 +180,61 @@ def _build_holistic_backend(log: Callable[[str], None], key: str) -> Optional[Po
         return poses, scores
 
     log("[pose] MediaPipe Holistic backend initialised.")
-    return runner
+    return
 
+def _resolve_pose_model_path(path: str) -> str:
+    """Return an absolute path for ``path`` searching common asset directories."""
+
+    candidate = Path(path)
+    if candidate.is_file():
+        return str(candidate)
+
+    search_roots: List[Path] = []
+
+    env_dirs = os.getenv("POSE_MODEL_DIR", "").strip()
+    if env_dirs:
+        for entry in env_dirs.split(os.pathsep):
+            if entry:
+                search_roots.append(Path(entry))
+
+    module_dir = Path(__file__).resolve().parent
+    search_roots.extend(
+        [
+            module_dir,
+            module_dir / "pose_models",
+            Path.cwd(),
+            Path.cwd() / "pose_models",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for root in search_roots:
+        try:
+            root_resolved = root.resolve()
+        except FileNotFoundError:
+            continue
+        if root_resolved in seen:
+            continue
+        seen.add(root_resolved)
+        test_path = root_resolved / path
+        if test_path.is_file():
+            return str(test_path)
+
+    return str(candidate)
 
 def _resolve_movenet_model(model_key: str) -> Tuple[str, int]:
     lowered = model_key.lower()
     if "movenet_lightning" in lowered:
-        return os.getenv("MOVENET_ONNX_PATH_LIGHTNING", "movenet_lightning.onnx"), 192
+        path = os.getenv("MOVENET_ONNX_PATH_LIGHTNING", "movenet_lightning.onnx")
+        return _resolve_pose_model_path(path), 192
     if "movenet_thunder" in lowered:
-        return os.getenv("MOVENET_ONNX_PATH_THUNDER", "movenet_thunder.onnx"), 256
+        path = os.getenv("MOVENET_ONNX_PATH_THUNDER", "movenet_thunder.onnx")
+        return _resolve_pose_model_path(path), 256
     # Default to thunder unless explicitly overridden via MOVENET_ONNX_PATH
     env_path = os.getenv("MOVENET_ONNX_PATH")
     if env_path:
-        return env_path, 256
-    return "movenet_thunder.onnx", 256
+        return _resolve_pose_model_path(env_path), 256
+    return _resolve_pose_model_path("movenet_thunder.onnx"), 256
 
 
 def _build_movenet_backend(log: Callable[[str], None], key: str) -> Optional[PoseBackend]:
@@ -309,15 +351,17 @@ def _build_movenet_backend(log: Callable[[str], None], key: str) -> Optional[Pos
 def _resolve_yolov8_pose_model(key: str) -> str:
     env_override = os.getenv("YOLOV8_POSE_MODEL")
     if env_override:
-        return env_override
+        return _resolve_pose_model_path(env_override)
     lowered = key.lower()
     if lowered.endswith(".pt") or lowered.endswith(".onnx"):
-        return key
+        return _resolve_pose_model_path(key)
+
     for variant in ("n", "s", "m", "l", "x"):
         token = f"yolov8{variant}"
         if token in lowered:
-            return f"{token}-pose.pt"
-    return "yolov8n-pose.pt"
+            return _resolve_pose_model_path(f"{token}-pose.pt")
+    return _resolve_pose_model_path("yolov8n-pose.pt")
+
 
 def _build_yolov8_pose_backend(log: Callable[[str], None], key: str) -> Optional[PoseBackend]:
     try:
