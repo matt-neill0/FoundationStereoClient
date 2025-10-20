@@ -298,13 +298,132 @@ def _body_to_pose_sample(body: dict, camera: PanopticCamera) -> PoseSample:
     return PoseSample(keypoints, visible)
 
 
-def load_frame_annotations(json_path: Path, camera: PanopticCamera) -> List[PoseSample]:
+def _body2d_to_pose_sample(body: dict) -> PoseSample:
+    joints = np.asarray(body.get("joints19", []), dtype=np.float32)
+    if joints.size == 0:
+        return PoseSample(
+            np.full((17, 2), np.nan, dtype=np.float32),
+            np.zeros((17,), dtype=np.uint8),
+        )
+
+    joints = joints.reshape(-1, 3)
+
+    keypoints = np.full((17, 2), np.nan, dtype=np.float32)
+    visible = np.zeros((17,), dtype=np.uint8)
+
+    for coco_idx, panoptic_idx in enumerate(PANOPTIC_COCO19_TO_COCO17):
+        if panoptic_idx >= joints.shape[0]:
+            continue
+        u, v, conf = joints[panoptic_idx]
+        if conf <= 0.0 or not (np.isfinite(u) and np.isfinite(v)):
+            continue
+        keypoints[coco_idx] = (u, v)
+        visible[coco_idx] = 1
+
+    return PoseSample(keypoints, visible)
+
+
+def load_frame_annotations(
+    json_path: Path,
+    camera: PanopticCamera,
+    json_2d_path: Optional[Path] = None,
+) -> List[PoseSample]:
+    if json_2d_path is not None and json_2d_path.exists():
+        with open(json_2d_path, "r", encoding="utf-8") as f:
+            data_2d = json.load(f)
+        bodies_2d = data_2d.get("bodies", [])
+        poses_2d = [_body2d_to_pose_sample(body) for body in bodies_2d]
+        poses_2d = [pose for pose in poses_2d if pose.visibility.any()]
+        if poses_2d:
+            return poses_2d
+
     if not json_path.exists():
         return []
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     bodies = data.get("bodies", [])
     return [_body_to_pose_sample(body, camera) for body in bodies]
+
+
+def _project_camera_coordinates(
+    camera: PanopticCamera, xyz_world: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Project world coordinates after transforming them into the camera frame.
+
+    The Panoptic annotations provide 3D joint locations in the global studio
+    frame.  Some sequences also ship with per-camera coordinates, but these are
+    not consistently available.  This helper mirrors :meth:`PanopticCamera.project`
+    while explicitly applying the rigid transform so we can prefer whichever
+    projection produces in-frame results for the current sample.
+    """
+
+    pts = np.asarray(xyz_world, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError("xyz_world must be shaped (N, 3[+])")
+
+    if pts.shape[0] == 0:
+        empty_uv = np.empty((0, 2), dtype=np.float32)
+        empty_depth = np.empty((0,), dtype=np.float32)
+        return empty_uv, empty_depth
+
+    cam = camera.R @ pts[:, :3].T + camera.t  # camera coordinates (mm)
+    cam = cam.T.astype(np.float64, copy=False)
+    z = cam[:, 2].astype(np.float32, copy=False)
+
+    eps = np.float32(1e-6)
+    valid = z > eps
+
+    uv = np.full((pts.shape[0], 2), np.nan, dtype=np.float32)
+
+    if np.any(valid):
+        cam_valid = cam[valid]
+        projected, _ = cv2.projectPoints(
+            cam_valid.reshape(-1, 1, 3),
+            np.zeros((3, 1), dtype=np.float64),
+            np.zeros((3, 1), dtype=np.float64),
+            camera._K,
+            camera._dist,
+        )
+        projected = projected.reshape(-1, 2).astype(np.float32)
+        uv[valid] = projected
+
+    depth = np.full((pts.shape[0],), np.nan, dtype=np.float32)
+    depth[valid] = z[valid]
+
+    return uv, depth
+
+
+def _score_projection(uv: np.ndarray, depth: np.ndarray, width: int, height: int) -> float:
+    """Score a projection based on how many joints land within the image."""
+
+    if uv.ndim != 2 or uv.shape[1] < 2 or depth.ndim != 1:
+        return 0.0
+
+    uv = np.asarray(uv, dtype=np.float32)
+    depth = np.asarray(depth, dtype=np.float32)
+
+    valid = (
+        np.isfinite(depth)
+        & (depth > 0.0)
+        & np.isfinite(uv[:, 0])
+        & np.isfinite(uv[:, 1])
+    )
+
+    if not np.any(valid):
+        return 0.0
+
+    inside = (
+        valid
+        & (uv[:, 0] >= 0.0)
+        & (uv[:, 0] < float(width))
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] < float(height))
+    )
+
+    # Prefer projections that yield more in-frame keypoints; break ties by the
+    # total number of finite keypoints so that partially visible skeletons still
+    # return a small positive score instead of zero.
+    return float(inside.sum()) + 0.1 * float(valid.sum())
 
 
 def _frame_id_from_path(image_path: Path) -> str:
@@ -529,6 +648,22 @@ def evaluate_sequence(
             right_frames = right_frames[:limit]
 
     annot_dir = dataset_root / "hdPose3d_stage1_coco19"
+    annot2d_dir: Optional[Path] = None
+    annot2d_root = dataset_root / "hdPose2d_stage1_coco19"
+    if annot2d_root.exists():
+        candidate_names = [left_cam.name.replace("hd_", ""), left_cam.name]
+        for candidate in candidate_names:
+            candidate = candidate.strip("_")
+            if not candidate:
+                continue
+            candidate_dir = annot2d_root / candidate
+            if candidate_dir.exists():
+                annot2d_dir = candidate_dir
+                on_log(
+                    f"[info] Using 2D annotations from {candidate_dir.relative_to(dataset_root)}"
+                )
+                break
+
     metrics = Metrics()
 
     total_frames = len(left_frames)
@@ -598,7 +733,13 @@ def evaluate_sequence(
 
         frame_id = _frame_id_from_path(left_path)
         frame_json = annot_dir / f"body3DScene_{frame_id}.json"
-        if not frame_json.exists():
+        frame_json_2d = (
+            annot2d_dir / f"body2DScene_{frame_id}.json" if annot2d_dir is not None else None
+        )
+        if (
+            (frame_json_2d is None or not frame_json_2d.exists())
+            and not frame_json.exists()
+        ):
             if skipped_missing_annotations < 5:
                 on_log(
                     f"[warn] Missing annotation file {frame_json.name}; skipping frame"
@@ -606,7 +747,7 @@ def evaluate_sequence(
             skipped_missing_annotations += 1
             continue
 
-        gt_poses = load_frame_annotations(frame_json, left_cam)
+        gt_poses = load_frame_annotations(frame_json, left_cam, frame_json_2d)
         frames_with_annotations += 1
         if gt_poses:
             frames_with_ground_truth += 1
