@@ -345,9 +345,7 @@ def load_frame_annotations(
     return [_body_to_pose_sample(body, camera) for body in bodies]
 
 
-def _project_camera_coordinates(
-    camera: PanopticCamera, xyz_world: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+def _project_camera_coordinates(camera: PanopticCamera, xyz_world: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Project world coordinates after transforming them into the camera frame.
 
     The Panoptic annotations provide 3D joint locations in the global studio
@@ -367,8 +365,7 @@ def _project_camera_coordinates(
         return empty_uv, empty_depth
 
     cam = camera.R @ pts[:, :3].T + camera.t  # camera coordinates (mm)
-    cam = cam.T.astype(np.float64, copy=False)
-    z = cam[:, 2].astype(np.float32, copy=False)
+    z = cam[2, :].astype(np.float32, copy=False)
 
     eps = np.float32(1e-6)
     valid = z > eps
@@ -376,16 +373,16 @@ def _project_camera_coordinates(
     uv = np.full((pts.shape[0], 2), np.nan, dtype=np.float32)
 
     if np.any(valid):
-        cam_valid = cam[valid]
-        projected, _ = cv2.projectPoints(
-            cam_valid.reshape(-1, 1, 3),
-            np.zeros((3, 1), dtype=np.float64),
-            np.zeros((3, 1), dtype=np.float64),
-            camera._K,
-            camera._dist,
-        )
-        projected = projected.reshape(-1, 2).astype(np.float32)
-        uv[valid] = projected
+        cam_valid = cam[:, valid].T.astype(np.float32)
+        homog = (camera.K @ cam_valid.T).T
+        w = homog[:, 2]
+        good = np.abs(w) > eps
+        good_idx = np.nonzero(valid)[0][good]
+        projected = homog[good]
+        uv_valid = np.empty((projected.shape[0], 2), dtype=np.float32)
+        uv_valid[:, 0] = projected[:, 0] / w[good]
+        uv_valid[:, 1] = projected[:, 1] / w[good]
+        uv[good_idx] = uv_valid
 
     depth = np.full((pts.shape[0],), np.nan, dtype=np.float32)
     depth[valid] = z[valid]
