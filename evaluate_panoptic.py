@@ -50,11 +50,11 @@ except Exception:  # pragma: no cover - TensorRT not installed
 
 # Mapping from CMU Panoptic "COCO19" joint indices to COCO-17 order expected by
 # the Foundation pose backends.  The Panoptic labels are::
-#   0:Nose 1:Neck 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
+#   0:Neck 1:Nose 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
 #   7:LWrist 8:RHip 9:RKnee 10:RAnkle 11:LHip 12:LKnee 13:LAnkle
 #   14:REye 15:LEye 16:REar 17:LEar 18:Chest
 PANOPTIC_COCO19_TO_COCO17 = [
-    0,   # nose
+    1,   # nose
     15,  # left_eye
     14,  # right_eye
     17,  # left_ear
