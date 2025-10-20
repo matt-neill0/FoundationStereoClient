@@ -54,23 +54,23 @@ except Exception:  # pragma: no cover - TensorRT not installed
 #   7:RWrist 8:LHip 9:LKnee 10:LAnkle 11:RHip 12:RKnee 13:RAnkle
 #   14:LEye 15:REye 16:LEar 17:REar 18:Chest
 PANOPTIC_COCO19_TO_COCO17 = [
-    1,   # nose
-    14,  # left_eye
+    1,  # nose
+    17,  # left_eye
     15,  # right_eye
-    16,  # left_ear
-    17,  # right_ear
-    2,   # left_shoulder
-    5,   # right_shoulder
-    3,   # left_elbow
-    6,   # right_elbow
-    4,   # left_wrist
-    7,   # right_wrist
-    8,   # left_hip
-    11,  # right_hip
-    9,   # left_knee
-    12,  # right_knee
-    10,  # left_ankle
-    13,  # right_ankle
+    18,  # left_ear
+    16,  # right_ear
+    3,   # left_shoulder
+    9,   # right_shoulder
+    4,   # left_elbow
+    10,   # right_elbow
+    5,   # left_wrist
+    11,   # right_wrist
+    6,   # left_hip
+    12,  # right_hip
+    7,   # left_knee
+    13,  # right_knee
+    8,  # left_ankle
+    14,  # right_ankle
 ]
 
 
