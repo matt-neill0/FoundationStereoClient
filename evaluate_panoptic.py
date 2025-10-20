@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 
 from pose_backends import PoseBackend, build_pose_backend
-from pose_augmentation import get_pose_model_info
+from pose_augmentation import draw_skeletons, get_pose_model_info
 
 try:  # SciPy is optional; fall back to a greedy matcher if unavailable.
     from scipy.optimize import linear_sum_assignment  # type: ignore
@@ -72,6 +72,12 @@ PANOPTIC_COCO19_TO_COCO17 = [
     13,  # left_ankle
     10,  # right_ankle
 ]
+
+
+PREDICTION_JOINT_COLOR = (0, 255, 0)
+PREDICTION_LIMB_COLOR = (255, 200, 0)
+GROUND_TRUTH_JOINT_COLOR = (0, 0, 255)
+GROUND_TRUTH_LIMB_COLOR = (0, 0, 255)
 
 
 @dataclass
@@ -147,8 +153,41 @@ class PanopticCamera:
         return uv.astype(np.float32), depth.astype(np.float32)
 
 
-def _normalise_camera_key(name: str) -> str:
-    return name.lower().replace("hd_", "").replace("cam", "").strip()
+_CAMERA_FAMILY_PRIORITY = {
+    "hd": 3,
+    "vga": 2,
+    "kinect": 1,
+}
+
+
+def _camera_family_priority(name: str) -> int:
+    key = name.lower().strip()
+    if "_" in key:
+        key = key.split("_", 1)[0]
+    if key.startswith("cam"):
+        key = "cam"
+    return _CAMERA_FAMILY_PRIORITY.get(key, 0)
+
+
+def _camera_aliases(name: str) -> List[str]:
+    base = name.lower().strip()
+    aliases = {base}
+
+    # Allow selecting cameras via their numeric suffix (e.g. ``00_16``)
+    for prefix in ("hd_", "vga_", "kinect_", "mono_", "optical_"):
+        if base.startswith(prefix):
+            aliases.add(base[len(prefix) :])
+
+    # Support short forms such as ``cam00`` → ``00``.
+    if base.startswith("cam"):
+        aliases.add(base[3:])
+
+    clean_aliases = {
+        alias.strip("_")
+        for alias in aliases
+        if alias.strip("_")
+    }
+    return sorted(clean_aliases)
 
 
 def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
@@ -156,6 +195,7 @@ def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
         calib = json.load(f)
 
     cameras: Dict[str, PanopticCamera] = {}
+    alias_priority: Dict[str, int] = {}
     entries: List[dict] = []
 
     if "cameras" in calib:
@@ -190,7 +230,13 @@ def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
             dist=np.asarray(entry.get("dist", [0, 0, 0, 0, 0]), dtype=np.float32),
             resolution=(int(resolution[0]), int(resolution[1])),
         )
-        cameras[_normalise_camera_key(name)] = cam
+        priority = _camera_family_priority(name)
+        for alias in _camera_aliases(name):
+            current_priority = alias_priority.get(alias)
+            if current_priority is not None and current_priority > priority:
+                continue
+            alias_priority[alias] = priority
+            cameras[alias] = cam
     if not cameras:
         raise ValueError("No camera calibration entries found")
     return cameras
@@ -200,6 +246,24 @@ def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
 class PoseSample:
     keypoints_uv: np.ndarray  # shape (17, 2)
     visibility: np.ndarray  # shape (17,) with {0,1}
+
+
+def _pose_sample_to_uvc(sample: PoseSample) -> np.ndarray:
+    keypoints = np.asarray(sample.keypoints_uv, dtype=np.float32)
+    conf = sample.visibility.astype(np.float32).reshape(-1, 1)
+    if keypoints.ndim != 2 or keypoints.shape[1] < 2:
+        raise ValueError("PoseSample keypoints must be shaped (K, 2)")
+    return np.concatenate([keypoints[:, :2], conf], axis=1)
+
+
+def _normalise_pose_uvc(pose: np.ndarray) -> Optional[np.ndarray]:
+    arr = np.asarray(pose, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return None
+    if arr.shape[1] == 2:
+        conf = np.ones((arr.shape[0], 1), dtype=np.float32)
+        return np.concatenate([arr[:, :2], conf], axis=1)
+    return arr[:, :3].astype(np.float32, copy=True)
 
 
 def _body_to_pose_sample(body: dict, camera: PanopticCamera) -> PoseSample:
@@ -383,15 +447,30 @@ def evaluate_sequence(
     pck_threshold: float,
     disparity_engine: Optional[TensorRTPipeline],
     on_log,
+    pose_model_key: Optional[str] = None,
+    visualise_dir: Optional[Path] = None,
 ) -> Metrics:
     calib_path = dataset_root / f"calibration_{dataset_root.name}.json"
     cameras = load_panoptic_calibration(calib_path)
 
+    vis_dir = visualise_dir
+    if vis_dir is not None:
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        on_log(f"[info] Saving pose visualisations to {vis_dir}")
+
     def resolve_camera(name: str) -> PanopticCamera:
-        key = _normalise_camera_key(name)
-        if key not in cameras:
-            raise KeyError(f"Camera '{name}' not found in calibration file {calib_path}")
-        return cameras[key]
+        key = str(name).lower().strip()
+        if key in cameras:
+            return cameras[key]
+
+        if key.startswith("hd_") and key[3:] in cameras:
+            return cameras[key[3:]]
+        if not key.startswith("hd_"):
+            hd_key = f"hd_{key}".strip("_")
+            if hd_key in cameras:
+                return cameras[hd_key]
+
+        raise KeyError(f"Camera '{name}' not found in calibration file {calib_path}")
 
     left_cam = resolve_camera(left_camera)
     right_cam = resolve_camera(right_camera) if right_camera else None
@@ -468,12 +547,12 @@ def evaluate_sequence(
         left_path = left_frames[frame_idx]
         right_path = right_frames[frame_idx] if right_cam is not None else None
 
-        left_img = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
-        if left_img is None:
+        left_img_native = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
+        if left_img_native is None:
             on_log(f"[warn] Failed to read {left_path}; skipping frame")
             continue
-        native_h, native_w = left_img.shape[:2]
-        left_img = _resize_if_needed(left_img, frame_width, frame_height)
+        native_h, native_w = left_img_native.shape[:2]
+        left_img = _resize_if_needed(left_img_native, frame_width, frame_height)
         resized_h, resized_w = left_img.shape[:2]
         scale_x = native_w / float(resized_w) if resized_w else 1.0
         scale_y = native_h / float(resized_h) if resized_h else 1.0
@@ -485,11 +564,11 @@ def evaluate_sequence(
             and baseline_m is not None
             and fx_px is not None
         ):
-            right_img = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
-            if right_img is None:
+            right_img_native = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
+            if right_img_native is None:
                 on_log(f"[warn] Failed to read {right_path}; skipping disparity")
             else:
-                right_img = _resize_if_needed(right_img, frame_width, frame_height)
+                right_img = _resize_if_needed(right_img_native, frame_width, frame_height)
                 disp = disparity_engine.infer(left_img, right_img)
                 if disp is not None:
                     depth_map = _depth_from_disparity(disp, fx_px, baseline_m)
@@ -548,6 +627,54 @@ def evaluate_sequence(
 
         metrics.false_positives += max(len(poses) - len(matched_preds), 0)
 
+        if vis_dir is not None:
+            pred_uvc: List[np.ndarray] = []
+            for pose in poses:
+                arr = _normalise_pose_uvc(pose)
+                if arr is not None:
+                    pred_uvc.append(arr)
+            gt_uvc = [_pose_sample_to_uvc(gt_pose) for gt_pose in gt_poses]
+            if pred_uvc or gt_uvc:
+                vis_image = left_img_native.copy()
+                if pred_uvc:
+                    vis_image = draw_skeletons(
+                        vis_image,
+                        pred_uvc,
+                        pose_model_key,
+                        joint_color=PREDICTION_JOINT_COLOR,
+                        limb_color=PREDICTION_LIMB_COLOR,
+                    )
+                if gt_uvc:
+                    vis_image = draw_skeletons(
+                        vis_image,
+                        gt_uvc,
+                        pose_model_key,
+                        joint_color=GROUND_TRUTH_JOINT_COLOR,
+                        limb_color=GROUND_TRUTH_LIMB_COLOR,
+                    )
+
+                legend_entries: List[Tuple[str, Tuple[int, int, int]]] = []
+                if pred_uvc:
+                    legend_entries.append(("Prediction", PREDICTION_JOINT_COLOR))
+                if gt_uvc:
+                    legend_entries.append(("Ground truth", GROUND_TRUTH_JOINT_COLOR))
+                for line_idx, (label, colour) in enumerate(legend_entries):
+                    origin = (10, 30 + line_idx * 25)
+                    cv2.putText(
+                        vis_image,
+                        label,
+                        origin,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        colour,
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                vis_path = vis_dir / f"{frame_id}.jpg"
+                if not cv2.imwrite(str(vis_path), vis_image):
+                    on_log(f"[warn] Failed to write visualisation to {vis_path}")
+
         if idx_pos and idx_pos % 50 == 0:
             summary = metrics.summary()
             on_log(
@@ -603,6 +730,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="PCK threshold as a fraction of the larger evaluation image dimension.",
     )
     parser.add_argument("--disparity-engine", type=Path, help="Optional TensorRT engine for disparity estimation.")
+    parser.add_argument(
+        "--visualise-dir",
+        type=Path,
+        help="Directory where per-frame pose overlays (prediction vs. ground truth) will be saved.",
+    )
     return parser.parse_args(argv)
 
 
@@ -617,7 +749,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("[error] Failed to initialise the requested pose backend.")
         return 1
 
-    info = get_pose_model_info(resolved_key or args.pose_model)
+    model_key = resolved_key or args.pose_model
+    info = get_pose_model_info(model_key)
     if info is not None:
         log(f"[info] Using pose backend: {info.display_name} ({info.key})")
 
@@ -638,6 +771,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pck_threshold=float(args.pck_threshold),
         disparity_engine=disparity_engine,
         on_log=log,
+        pose_model_key=model_key,
+        visualise_dir=args.visualise_dir,
     )
 
     summary = metrics.summary()
