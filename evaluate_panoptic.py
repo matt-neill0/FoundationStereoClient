@@ -48,30 +48,59 @@ except Exception:  # pragma: no cover - TensorRT not installed
     TensorRTPipeline = None  # type: ignore
     TensorRTUnavailableError = RuntimeError  # type: ignore
 
-# Mapping from CMU Panoptic "COCO19" joint indices to COCO-17 order expected by
-# the Foundation pose backends.  The Panoptic labels are::
-#   0:Neck 1:Nose 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
-#   7:LWrist 8:RHip 9:RKnee 10:RAnkle 11:LHip 12:LKnee 13:LAnkle
-#   14:REye 15:LEye 16:REar 17:LEar 18:Chest
-PANOPTIC_COCO19_TO_COCO17 = [
-    1,   # nose
-    15,  # left_eye
-    14,  # right_eye
-    17,  # left_ear
-    16,  # right_ear
-    5,   # left_shoulder
-    2,   # right_shoulder
-    6,   # left_elbow
-    3,   # right_elbow
-    7,   # left_wrist
-    4,   # right_wrist
-    11,  # left_hip
-    8,   # right_hip
-    12,  # left_knee
-    9,   # right_knee
-    13,  # left_ankle
-    10,  # right_ankle
-]
+# Mapping from CMU Panoptic "COCO19" joint indices to the COCO-17 order expected
+# by the Foundation pose backends.  The Panoptic toolchain extends the canonical
+# COCO skeleton by prepending ``neck`` and appending ``chest`` while keeping the
+# remaining keypoints in their left/right COCO order.  Express the mapping in
+# terms of joint labels so the relationship is explicit and easy to verify
+# against the upstream specification.
+COCO17_KEYPOINT_LABELS: Tuple[str, ...] = (
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+)
+
+PANOPTIC_COCO19_KEYPOINT_LABELS: Tuple[str, ...] = (
+    "neck",
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+    "chest",
+)
+
+_PANOPTIC_LABEL_TO_INDEX = {label: idx for idx, label in enumerate(PANOPTIC_COCO19_KEYPOINT_LABELS)}
+
+PANOPTIC_COCO19_TO_COCO17: Tuple[int, ...] = tuple(
+    _PANOPTIC_LABEL_TO_INDEX[label] for label in COCO17_KEYPOINT_LABELS
+)
 
 
 PREDICTION_JOINT_COLOR = (0, 255, 0)
