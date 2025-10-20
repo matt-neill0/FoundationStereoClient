@@ -285,6 +285,9 @@ class LocalEngineRunner:
         self._capture_started = False
         self._use_realsense = self._determine_realsense_flag(use_realsense)
         self._save_dir_prepared = False
+        self._video_writer: Optional[cv2.VideoWriter] = None
+        self._video_frame_size: Optional[Tuple[int, int]] = None
+        self._video_path: Optional[Path] = None
         self._rs_fx_px: Optional[float] = None
         self._rs_baseline_m: Optional[float] = None
         self._log_pose_configuration()
@@ -505,28 +508,59 @@ class LocalEngineRunner:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self._save_dir_prepared = True
 
-    def _save_result(self, seq: int, png16: bytes) -> None:
+    def _to_grayscale_bgr(self, image_bgr: np.ndarray) -> np.ndarray:
+        if image_bgr.ndim == 2 or image_bgr.shape[2] == 1:
+            gray = image_bgr if image_bgr.ndim == 2 else image_bgr[:, :, 0]
+        else:
+            gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    def _save_video_frame(self, frame_bgr: np.ndarray) -> None:
         if self.save_dir is None:
             return
+
         self._ensure_save_dir()
-        fname = self.save_dir / f"disparity_seq{seq:06d}.png"
-        with open(fname, "wb") as f:
-            f.write(png16)
+        height, width = frame_bgr.shape[:2]
+        frame_size = (width, height)
+
+        if self._video_writer is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            output_path = self.save_dir / f"{self.session_id}.mp4"
+            writer = cv2.VideoWriter(str(output_path), fourcc, self.fps or DEFAULT_FPS, frame_size)
+            if not writer.isOpened():
+                self._log(f"[local] Failed to open video writer at {output_path}.")
+                return
+            self._video_writer = writer
+            self._video_frame_size = frame_size
+            self._video_path = output_path
+            self._log(f"[local] Saving video to {output_path}")
+        else:
+            if frame_size != self._video_frame_size:
+                self._log(
+                    "[local] Skipping frame with mismatched size %s (expected %s)."
+                    % (frame_size, self._video_frame_size)
+                )
+                return
+
+        writer = self._video_writer
+        if writer is not None:
+            writer.write(frame_bgr)
 
     def _apply_pose_overlay(
         self, image_bgr: np.ndarray, poses_uvc: Optional[List[np.ndarray]]
     ) -> np.ndarray:
+        canvas = np.ascontiguousarray(image_bgr.copy())
         if not poses_uvc:
-            return image_bgr
+            return canvas
         try:
             return draw_skeletons(
-                image_bgr,
+                canvas,
                 [np.asarray(kp, dtype=np.float32) for kp in poses_uvc],
                 self._resolved_pose_key or self.pose_model,
             )
         except Exception as exc:
             self._log(f"[pose] Failed to draw preview skeletons: {exc}")
-            return image_bgr
+            return canvas
 
     def _render_preview(
         self,
@@ -583,6 +617,16 @@ class LocalEngineRunner:
         if self.preview:
             cv2.destroyAllWindows()
         self._stop_capture_threads()
+        if self._video_writer is not None:
+            try:
+                self._video_writer.release()
+            except Exception:
+                pass
+        if self._video_path is not None:
+            self._log(f"[local] Video saved to {self._video_path}")
+        self._video_writer = None
+        self._video_frame_size = None
+        self._video_path = None
 
     def run(self) -> None:
         self._stop_event.clear()
@@ -697,12 +741,15 @@ class LocalEngineRunner:
                     if disp is not None:
                         png16 = self._encode_disparity(disp)
                         self._emit_result(seq, png16)
-                        self._save_result(seq, png16)
                     else:
                         self._emit_rgb_preview(seq, left_bgr)
 
                     preview_poses = poses_uvc if self.pose_enabled else None
                     preview_frame = self._apply_pose_overlay(left_bgr, preview_poses)
+                    record_frame = self._apply_pose_overlay(
+                        self._to_grayscale_bgr(left_bgr), preview_poses
+                    )
+                    self._save_video_frame(record_frame)
 
                     if disp is None:
                         self._emit_rgb_preview(seq, preview_frame)
