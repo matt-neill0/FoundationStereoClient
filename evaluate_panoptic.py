@@ -50,11 +50,11 @@ except Exception:  # pragma: no cover - TensorRT not installed
 
 # Mapping from CMU Panoptic "COCO19" joint indices to COCO-17 order expected by
 # the Foundation pose backends.  The Panoptic labels are::
-#   0:Nose 1:Neck 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
+#   0:Neck 1:Nose 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
 #   7:LWrist 8:RHip 9:RKnee 10:RAnkle 11:LHip 12:LKnee 13:LAnkle
 #   14:REye 15:LEye 16:REar 17:LEar 18:Chest
 PANOPTIC_COCO19_TO_COCO17 = [
-    0,   # nose
+    1,   # nose
     15,  # left_eye
     14,  # right_eye
     17,  # left_ear
@@ -151,127 +151,6 @@ class PanopticCamera:
         depth[~valid] = np.nan
 
         return uv.astype(np.float32), depth.astype(np.float32)
-
-
-def _coerce_panoptic_camera(
-    camera: Any,
-    *,
-    K: Optional[np.ndarray] = None,
-    R: Optional[np.ndarray] = None,
-    t: Optional[np.ndarray] = None,
-    dist: Optional[np.ndarray] = None,
-    resolution: Optional[Tuple[int, int]] = None,
-    name: Optional[str] = None,
-) -> PanopticCamera:
-    """Convert assorted calibration containers into :class:`PanopticCamera`.
-
-    The visualisation and evaluation helpers historically accepted raw
-    calibration dictionaries or loose arrays.  The modern implementation wraps
-    these parameters in :class:`PanopticCamera` for convenience, but external
-    callers may still pass the legacy inputs.  This helper accepts any of those
-    formats and produces a ``PanopticCamera`` instance.
-    """
-
-    if isinstance(camera, PanopticCamera):
-        return camera
-
-    if hasattr(camera, "project") and callable(getattr(camera, "project")):
-        # Duck-typed object exposing ``project`` – assume it already behaves like
-        # ``PanopticCamera`` (e.g. a subclass).
-        return camera  # type: ignore[return-value]
-
-    mapping: Optional[Mapping[str, Any]] = None
-    if isinstance(camera, Mapping):
-        mapping = camera
-    elif camera is None:
-        mapping = None
-    else:
-        # ``camera`` may actually be the XYZ array when callers rely on the
-        # legacy positional signature; leave coercion to the caller.
-        raise TypeError("camera calibration parameters are missing")
-
-    if mapping is not None:
-        if K is None and "K" in mapping:
-            K = mapping["K"]
-        if R is None and "R" in mapping:
-            R = mapping["R"]
-        if t is None and "t" in mapping:
-            t = mapping["t"]
-        if dist is None and "dist" in mapping:
-            dist = mapping["dist"]
-        if resolution is None and "resolution" in mapping:
-            res_val = mapping["resolution"]
-            if isinstance(res_val, Sequence) and len(res_val) >= 2:
-                resolution = (int(res_val[0]), int(res_val[1]))
-        if name is None and "name" in mapping:
-            name = str(mapping["name"])
-
-    if K is None or R is None or t is None:
-        raise TypeError("camera calibration parameters are missing")
-
-    if resolution is None:
-        resolution = (1920, 1080)
-
-    if dist is None:
-        dist = np.zeros((5,), dtype=np.float32)
-
-    resolved_name = (name or "camera").strip()
-
-    return PanopticCamera(
-        name=resolved_name or "camera",
-        K=np.asarray(K, dtype=np.float32),
-        R=np.asarray(R, dtype=np.float32),
-        t=np.asarray(t, dtype=np.float32),
-        dist=np.asarray(dist, dtype=np.float32),
-        resolution=(int(resolution[0]), int(resolution[1])),
-    )
-
-
-def _project_camera_coordinates(
-    camera_or_points: Any,
-    points_or_camera: Any,
-    *,
-    K: Optional[np.ndarray] = None,
-    R: Optional[np.ndarray] = None,
-    t: Optional[np.ndarray] = None,
-    dist: Optional[np.ndarray] = None,
-    resolution: Optional[Tuple[int, int]] = None,
-    name: Optional[str] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Project 3D points to image pixels using flexible calibration inputs.
-
-    The helper mirrors the historical ``_project_camera_coordinates`` signature
-    where the caller could pass either ``(camera, points)`` or ``(points,
-    camera)`` alongside raw calibration arrays.  Newer code calls
-    :meth:`PanopticCamera.project` directly, but downstream notebooks may still
-    rely on the legacy helper, so keep it available as a light wrapper.
-    """
-
-    last_error: Optional[Exception] = None
-    for candidate_camera, candidate_points in (
-        (camera_or_points, points_or_camera),
-        (points_or_camera, camera_or_points),
-    ):
-        try:
-            camera_obj = _coerce_panoptic_camera(
-                candidate_camera,
-                K=K,
-                R=R,
-                t=t,
-                dist=dist,
-                resolution=resolution,
-                name=name,
-            )
-        except TypeError as exc:
-            last_error = exc
-            continue
-
-        pts = np.asarray(candidate_points, dtype=np.float32)
-        return camera_obj.project(pts)
-
-    if last_error is None:
-        last_error = TypeError("unable to determine camera calibration inputs")
-    raise last_error
 
 
 _CAMERA_FAMILY_PRIORITY = {
@@ -392,7 +271,16 @@ def _body_to_pose_sample(body: dict, camera: PanopticCamera) -> PoseSample:
     if joints.size == 0:
         return PoseSample(np.full((17, 2), np.nan, dtype=np.float32), np.zeros((17,), dtype=np.uint8))
 
-    uv, _depth = camera.project(joints[:, :3])
+    uv_world, depth_world = camera.project(joints[:, :3])
+    uv_camera, depth_camera = _project_camera_coordinates(camera, joints[:, :3])
+
+    score_world = _score_projection(uv_world, depth_world, camera.width, camera.height)
+    score_camera = _score_projection(uv_camera, depth_camera, camera.width, camera.height)
+
+    if score_camera > score_world:
+        uv = uv_camera
+    else:
+        uv = uv_world
     conf = joints[:, 3]
 
     keypoints = np.full((17, 2), np.nan, dtype=np.float32)
