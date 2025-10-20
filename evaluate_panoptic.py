@@ -266,21 +266,27 @@ def _normalise_pose_uvc(pose: np.ndarray) -> Optional[np.ndarray]:
     return arr[:, :3].astype(np.float32, copy=True)
 
 
-def _body_to_pose_sample(body: dict, camera: PanopticCamera) -> PoseSample:
+def _body_to_pose_sample(
+    body: dict,
+    camera: PanopticCamera,
+    *,
+    prefer_camera_frame: bool = False,
+) -> PoseSample:
     joints = np.asarray(body.get("joints19", []), dtype=np.float32).reshape(-1, 4)
     if joints.size == 0:
         return PoseSample(np.full((17, 2), np.nan, dtype=np.float32), np.zeros((17,), dtype=np.uint8))
 
     uv_world, depth_world = camera.project(joints[:, :3])
-    uv_camera, depth_camera = _project_camera_coordinates(camera, joints[:, :3])
-
     score_world = _score_projection(uv_world, depth_world, camera.width, camera.height)
-    score_camera = _score_projection(uv_camera, depth_camera, camera.width, camera.height)
 
-    if score_camera > score_world:
-        uv = uv_camera
-    else:
-        uv = uv_world
+    uv = uv_world
+
+    if prefer_camera_frame or score_world <= 0.0:
+        uv_camera, depth_camera = _project_camera_coordinates(camera, joints[:, :3])
+        score_camera = _score_projection(uv_camera, depth_camera, camera.width, camera.height)
+
+        if score_camera > score_world:
+            uv = uv_camera
     conf = joints[:, 3]
 
     keypoints = np.full((17, 2), np.nan, dtype=np.float32)
@@ -304,7 +310,70 @@ def load_frame_annotations(json_path: Path, camera: PanopticCamera) -> List[Pose
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     bodies = data.get("bodies", [])
-    return [_body_to_pose_sample(body, camera) for body in bodies]
+    prefer_camera_frame = any("hdpose3d" in part.lower() for part in json_path.parts)
+    return [
+        _body_to_pose_sample(body, camera, prefer_camera_frame=prefer_camera_frame)
+        for body in bodies
+    ]
+
+
+def _project_camera_coordinates(camera: PanopticCamera, xyz_camera: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Project XYZ already expressed in the camera reference frame."""
+
+    pts = np.asarray(xyz_camera, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError("xyz_camera must be shaped (N, 3[+])")
+
+    if pts.shape[0] == 0:
+        return (
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+
+    projected, _ = cv2.projectPoints(
+        np.ascontiguousarray(pts[:, :3], dtype=np.float64).reshape(-1, 1, 3),
+        np.zeros((3, 1), dtype=np.float64),
+        np.zeros((3, 1), dtype=np.float64),
+        camera._K,
+        camera._dist,
+    )
+
+    uv = projected.reshape(-1, 2)
+    depth = pts[:, 2]
+    return uv.astype(np.float32), depth.astype(np.float32)
+
+
+def _score_projection(uv: np.ndarray, depth: np.ndarray, width: int, height: int) -> float:
+    """Score a projection based on how many joints land within the image."""
+
+    if uv.ndim != 2 or uv.shape[1] < 2 or depth.ndim != 1:
+        return 0.0
+
+    uv = np.asarray(uv, dtype=np.float32)
+    depth = np.asarray(depth, dtype=np.float32)
+
+    valid = (
+        np.isfinite(depth)
+        & (depth > 0.0)
+        & np.isfinite(uv[:, 0])
+        & np.isfinite(uv[:, 1])
+    )
+
+    if not np.any(valid):
+        return 0.0
+
+    inside = (
+        valid
+        & (uv[:, 0] >= 0.0)
+        & (uv[:, 0] < float(width))
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] < float(height))
+    )
+
+    # Prefer projections that yield more in-frame keypoints; break ties by the
+    # total number of finite keypoints so that partially visible skeletons still
+    # return a small positive score instead of zero.
+    return float(inside.sum()) + 0.1 * float(valid.sum())
 
 
 def _frame_id_from_path(image_path: Path) -> str:
