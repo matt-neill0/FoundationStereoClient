@@ -27,7 +27,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -107,6 +107,28 @@ class PanopticCamera:
         rvec, _ = cv2.Rodrigues(R64)
         self._rvec = np.ascontiguousarray(rvec)
         self._tvec = np.ascontiguousarray(self._t.reshape(3, 1))
+
+        # Some Panoptic calibration dumps report extrinsics that map either from
+        # world→camera or camera→world.  Cache both the provided transform and
+        # its inverse so downstream code can score whichever projection lands
+        # the joints inside the image bounds.
+        self._world_projectors: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+
+        base_t = np.ascontiguousarray(self._t.reshape(3, 1))
+        base_tvec = np.ascontiguousarray(self._tvec.reshape(3, 1))
+        self._world_projectors.append((self._R, base_t, self._rvec, base_tvec))
+
+        R_inv = self._R.T
+        t_inv = (-R_inv @ base_t).reshape(3, 1)
+        rvec_inv, _ = cv2.Rodrigues(R_inv)
+        self._world_projectors.append(
+            (
+                np.ascontiguousarray(R_inv),
+                np.ascontiguousarray(t_inv),
+                np.ascontiguousarray(rvec_inv),
+                np.ascontiguousarray(t_inv.reshape(3, 1)),
+            )
+        )
 
     @property
     def width(self) -> int:
@@ -271,16 +293,7 @@ def _body_to_pose_sample(body: dict, camera: PanopticCamera) -> PoseSample:
     if joints.size == 0:
         return PoseSample(np.full((17, 2), np.nan, dtype=np.float32), np.zeros((17,), dtype=np.uint8))
 
-    uv_world, depth_world = camera.project(joints[:, :3])
-    uv_camera, depth_camera = _project_camera_coordinates(camera, joints[:, :3])
-
-    score_world = _score_projection(uv_world, depth_world, camera.width, camera.height)
-    score_camera = _score_projection(uv_camera, depth_camera, camera.width, camera.height)
-
-    if score_camera > score_world:
-        uv = uv_camera
-    else:
-        uv = uv_world
+    uv, _depth = _select_best_projection(camera, joints[:, :3])
     conf = joints[:, 3]
 
     keypoints = np.full((17, 2), np.nan, dtype=np.float32)
@@ -305,6 +318,168 @@ def load_frame_annotations(json_path: Path, camera: PanopticCamera) -> List[Pose
         data = json.load(f)
     bodies = data.get("bodies", [])
     return [_body_to_pose_sample(body, camera) for body in bodies]
+
+
+def _project_camera_coordinates(camera: PanopticCamera, xyz_camera: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Project XYZ already expressed in the camera reference frame."""
+
+    pts = np.asarray(xyz_camera, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError("xyz_camera must be shaped (N, 3[+])")
+
+    if pts.shape[0] == 0:
+        return (
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+
+    projected, _ = cv2.projectPoints(
+        np.ascontiguousarray(pts[:, :3], dtype=np.float64).reshape(-1, 1, 3),
+        np.zeros((3, 1), dtype=np.float64),
+        np.zeros((3, 1), dtype=np.float64),
+        camera._K,
+        camera._dist,
+    )
+
+    uv = projected.reshape(-1, 2)
+    depth = pts[:, 2]
+    return uv.astype(np.float32), depth.astype(np.float32)
+
+
+def _project_with_extrinsics(
+    camera: PanopticCamera,
+    xyz_world: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(xyz_world, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError("xyz_world must be shaped (N, 3[+])")
+
+    pts3 = np.ascontiguousarray(pts[:, :3], dtype=np.float64)
+    projected, _ = cv2.projectPoints(
+        pts3.reshape(-1, 1, 3),
+        np.ascontiguousarray(rvec, dtype=np.float64),
+        np.ascontiguousarray(tvec, dtype=np.float64),
+        camera._K,
+        camera._dist,
+    )
+
+    uv = projected.reshape(-1, 2)
+
+    Rm = np.ascontiguousarray(R, dtype=np.float64)
+    tm = np.ascontiguousarray(t, dtype=np.float64).reshape(3, 1)
+    cam = Rm @ pts3.T + tm
+    depth = cam[2, :]
+
+    return uv.astype(np.float32), depth.astype(np.float32)
+
+
+def _world_projection_candidates(camera: PanopticCamera, xyz_world: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+    pts = np.asarray(xyz_world, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return []
+
+    coords = pts[:, :3]
+    finite = coords[np.isfinite(coords)]
+    scales: List[float] = [1.0]
+    if finite.size:
+        max_abs = float(np.max(np.abs(finite)))
+        if max_abs < 50.0:
+            scales.append(10.0)
+        if max_abs < 5.0:
+            scales.append(100.0)
+        if max_abs < 0.5:
+            scales.append(1000.0)
+        if max_abs > 500.0:
+            scales.append(0.1)
+        if max_abs > 5000.0:
+            scales.append(0.01)
+        if max_abs > 50000.0:
+            scales.append(0.001)
+
+    seen_scales: Set[float] = set()
+    candidates: List[Tuple[np.ndarray, np.ndarray]] = []
+    projectors = getattr(camera, "_world_projectors", None)
+    if not projectors:
+        projectors = [
+            (camera._R, camera._t, camera._rvec, camera._tvec),
+        ]
+
+    for scale in scales:
+        if scale in seen_scales:
+            continue
+        seen_scales.add(scale)
+        scaled = coords * scale
+        for R, t, rvec, tvec in projectors:
+            try:
+                uv, depth = _project_with_extrinsics(camera, scaled, R, t, rvec, tvec)
+            except cv2.error:
+                continue
+            candidates.append((uv, depth))
+
+    return candidates
+
+
+def _select_best_projection(camera: PanopticCamera, joints_xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    world_candidates = _world_projection_candidates(camera, joints_xyz)
+    uv_camera, depth_camera = _project_camera_coordinates(camera, joints_xyz)
+
+    candidates: List[Tuple[float, np.ndarray, np.ndarray]] = []
+
+    for uv, depth in world_candidates:
+        score = _score_projection(uv, depth, camera.width, camera.height)
+        candidates.append((score, uv, depth))
+
+    score_camera = _score_projection(uv_camera, depth_camera, camera.width, camera.height)
+    candidates.append((score_camera, uv_camera, depth_camera))
+
+    if not candidates:
+        return (
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+
+    best_score, best_uv, best_depth = max(candidates, key=lambda item: item[0])
+    if best_score <= 0.0:
+        best_score, best_uv, best_depth = candidates[0]
+
+    return best_uv, best_depth
+
+
+def _score_projection(uv: np.ndarray, depth: np.ndarray, width: int, height: int) -> float:
+    """Score a projection based on how many joints land within the image."""
+
+    if uv.ndim != 2 or uv.shape[1] < 2 or depth.ndim != 1:
+        return 0.0
+
+    uv = np.asarray(uv, dtype=np.float32)
+    depth = np.asarray(depth, dtype=np.float32)
+
+    valid = (
+        np.isfinite(depth)
+        & (depth > 0.0)
+        & np.isfinite(uv[:, 0])
+        & np.isfinite(uv[:, 1])
+    )
+
+    if not np.any(valid):
+        return 0.0
+
+    inside = (
+        valid
+        & (uv[:, 0] >= 0.0)
+        & (uv[:, 0] < float(width))
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] < float(height))
+    )
+
+    # Prefer projections that yield more in-frame keypoints; break ties by the
+    # total number of finite keypoints so that partially visible skeletons still
+    # return a small positive score instead of zero.
+    return float(inside.sum()) + 0.1 * float(valid.sum())
 
 
 def _frame_id_from_path(image_path: Path) -> str:
