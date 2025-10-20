@@ -509,20 +509,36 @@ def draw_skeletons(
     poses_uvc: list[np.ndarray],  # list of (K,3) [u,v,conf]
     model_key: str | None,
     conf_thresh: float = 0.2,
+    joint_color: tuple[int, int, int] = (0, 255, 0),
+    limb_color: tuple[int, int, int] = (255, 200, 0),
 ) -> np.ndarray:
-    """Draw 2D skeletons on a BGR image and return a copy."""
+    """Draw 2D skeletons on a BGR image and return a copy.
+
+    Parameters
+    ----------
+    image_bgr:
+        Base image to draw on.
+    poses_uvc:
+        List of keypoint arrays with columns ``(u, v, confidence)``.
+    model_key:
+        Pose model identifier used to resolve the skeleton topology.
+    conf_thresh:
+        Minimum confidence required for joints/limbs to be rendered.
+    joint_color / limb_color:
+        BGR colours used for the joint circles and limb segments respectively.
+    """
     out = image_bgr.copy()
     edges = get_skeleton_edges(model_key)
     for kp in poses_uvc:
         # joints
         for (u, v, c) in kp:
             if c >= conf_thresh and np.isfinite(u) and np.isfinite(v):
-                cv2.circle(out, (int(round(u)), int(round(v))), 2, (0, 255, 0), -1)
+                cv2.circle(out, (int(round(u)), int(round(v))), 2, joint_color, -1)
         # limbs
         for a, b in edges:
             if a < kp.shape[0] and b < kp.shape[0]:
                 ua, va, ca = kp[a]
                 ub, vb, cb = kp[b]
                 if min(ca, cb) >= conf_thresh and all(np.isfinite(x) for x in (ua, va, ub, vb)):
-                    cv2.line(out, (int(round(ua)), int(round(va))), (int(round(ub)), int(round(vb))), (255, 200, 0), 2)
+                    cv2.line(out, (int(round(ua)), int(round(va))), (int(round(ub)), int(round(vb))), limb_color, 2)
     return out
