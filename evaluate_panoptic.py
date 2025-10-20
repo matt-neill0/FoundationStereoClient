@@ -417,9 +417,9 @@ def evaluate_sequence(
     else:
         frame_indices = list(frame_indices)
 
-    eval_width = frame_width if frame_width is not None else left_cam.width
-    eval_height = frame_height if frame_height is not None else left_cam.height
-    threshold_px = pck_threshold * max(eval_width, eval_height)
+    native_width = left_cam.width
+    native_height = left_cam.height
+    threshold_px = pck_threshold * max(native_width, native_height)
     on_log(
         f"[info] Evaluating {len(frame_indices)} frames from camera {left_cam.name}"
         f" with PCK threshold {threshold_px:.1f} px"
@@ -439,7 +439,11 @@ def evaluate_sequence(
         if left_img is None:
             on_log(f"[warn] Failed to read {left_path}; skipping frame")
             continue
+        native_h, native_w = left_img.shape[:2]
         left_img = _resize_if_needed(left_img, frame_width, frame_height)
+        resized_h, resized_w = left_img.shape[:2]
+        scale_x = native_w / float(resized_w) if resized_w else 1.0
+        scale_y = native_h / float(resized_h) if resized_h else 1.0
 
         depth_map: Optional[np.ndarray] = None
         if (
@@ -457,6 +461,19 @@ def evaluate_sequence(
                 if disp is not None:
                     depth_map = _depth_from_disparity(disp, fx_px, baseline_m)
         poses, _scores = pose_backend(left_img, depth_map)
+
+        if scale_x != 1.0 or scale_y != 1.0:
+            scaled: List[np.ndarray] = []
+            for pose in poses:
+                arr = np.asarray(pose, dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[1] < 2:
+                    scaled.append(arr)
+                    continue
+                arr = arr.copy()
+                arr[:, 0] *= scale_x
+                arr[:, 1] *= scale_y
+                scaled.append(arr)
+            poses = scaled
 
         frame_id = _frame_id_from_path(left_path)
         frame_json = annot_dir / f"body3DScene_{frame_id}.json"
