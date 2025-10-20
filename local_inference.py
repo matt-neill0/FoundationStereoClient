@@ -515,6 +515,21 @@ class LocalEngineRunner:
             gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
+    def _recording_base_frame(self, left_bgr: np.ndarray) -> np.ndarray:
+        """Select the frame used as the base for saved video output."""
+
+        if not self._use_realsense or cam is None:
+            return left_bgr
+
+        preview = cam.get_preview_frame()
+        if preview is None:
+            return left_bgr
+
+        try:
+            return self._resize_frame(preview)
+        except Exception:
+            return left_bgr
+
     def _save_video_frame(self, frame_bgr: np.ndarray) -> None:
         if self.save_dir is None:
             return
@@ -746,8 +761,9 @@ class LocalEngineRunner:
 
                     preview_poses = poses_uvc if self.pose_enabled else None
                     preview_frame = self._apply_pose_overlay(left_bgr, preview_poses)
+                    record_base = self._recording_base_frame(left_bgr)
                     record_frame = self._apply_pose_overlay(
-                        self._to_grayscale_bgr(left_bgr), preview_poses
+                        self._to_grayscale_bgr(record_base), preview_poses
                     )
                     self._save_video_frame(record_frame)
 
