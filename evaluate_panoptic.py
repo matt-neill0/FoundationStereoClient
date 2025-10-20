@@ -231,7 +231,16 @@ def _body_to_pose_sample(body: dict, camera: PanopticCamera) -> PoseSample:
     if joints.size == 0:
         return PoseSample(np.full((17, 2), np.nan, dtype=np.float32), np.zeros((17,), dtype=np.uint8))
 
-    uv, _depth = camera.project(joints[:, :3])
+    uv_world, depth_world = camera.project(joints[:, :3])
+    uv_camera, depth_camera = _project_camera_coordinates(camera, joints[:, :3])
+
+    score_world = _score_projection(uv_world, depth_world, camera.width, camera.height)
+    score_camera = _score_projection(uv_camera, depth_camera, camera.width, camera.height)
+
+    if score_camera > score_world:
+        uv = uv_camera
+    else:
+        uv = uv_world
     conf = joints[:, 3]
 
     keypoints = np.full((17, 2), np.nan, dtype=np.float32)
