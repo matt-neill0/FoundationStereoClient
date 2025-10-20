@@ -50,11 +50,11 @@ except Exception:  # pragma: no cover - TensorRT not installed
 
 # Mapping from CMU Panoptic "COCO19" joint indices to COCO-17 order expected by
 # the Foundation pose backends.  The Panoptic labels are::
-#   0:Nose 1:Neck 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
+#   0:Neck 1:Nose 2:RShoulder 3:RElbow 4:RWrist 5:LShoulder 6:LElbow
 #   7:LWrist 8:RHip 9:RKnee 10:RAnkle 11:LHip 12:LKnee 13:LAnkle
 #   14:REye 15:LEye 16:REar 17:LEar 18:Chest
 PANOPTIC_COCO19_TO_COCO17 = [
-    0,   # nose
+    1,   # nose
     15,  # left_eye
     14,  # right_eye
     17,  # left_ear
@@ -206,47 +206,6 @@ def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
 class PoseSample:
     keypoints_uv: np.ndarray  # shape (17, 2)
     visibility: np.ndarray  # shape (17,) with {0,1}
-
-
-def _project_camera_coordinates(camera: PanopticCamera, xyz_camera: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Project XYZ already expressed in the camera reference frame."""
-
-    pts = np.asarray(xyz_camera, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[1] < 3:
-        raise ValueError("xyz_camera must be shaped (N,3[+])")
-    if pts.shape[0] == 0:
-        return (
-            np.empty((0, 2), dtype=np.float32),
-            np.empty((0,), dtype=np.float32),
-        )
-
-    projected, _ = cv2.projectPoints(
-        np.ascontiguousarray(pts[:, :3], dtype=np.float64).reshape(-1, 1, 3),
-        np.zeros((3, 1), dtype=np.float64),
-        np.zeros((3, 1), dtype=np.float64),
-        camera._K,
-        camera._dist,
-    )
-
-    uv = projected.reshape(-1, 2)
-    depth = pts[:, 2]
-    return uv.astype(np.float32), depth.astype(np.float32)
-
-
-def _score_projection(uv: np.ndarray, depth: np.ndarray, width: int, height: int) -> int:
-    if uv.size == 0 or depth.size == 0:
-        return 0
-    valid = (
-        np.isfinite(uv[:, 0])
-        & np.isfinite(uv[:, 1])
-        & np.isfinite(depth)
-        & (depth > 0)
-        & (uv[:, 0] >= 0)
-        & (uv[:, 0] < width)
-        & (uv[:, 1] >= 0)
-        & (uv[:, 1] < height)
-    )
-    return int(np.count_nonzero(valid))
 
 
 def _pose_sample_to_uvc(sample: PoseSample) -> np.ndarray:
