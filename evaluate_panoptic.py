@@ -153,8 +153,41 @@ class PanopticCamera:
         return uv.astype(np.float32), depth.astype(np.float32)
 
 
-def _normalise_camera_key(name: str) -> str:
-    return name.lower().replace("hd_", "").replace("cam", "").strip()
+_CAMERA_FAMILY_PRIORITY = {
+    "hd": 3,
+    "vga": 2,
+    "kinect": 1,
+}
+
+
+def _camera_family_priority(name: str) -> int:
+    key = name.lower().strip()
+    if "_" in key:
+        key = key.split("_", 1)[0]
+    if key.startswith("cam"):
+        key = "cam"
+    return _CAMERA_FAMILY_PRIORITY.get(key, 0)
+
+
+def _camera_aliases(name: str) -> List[str]:
+    base = name.lower().strip()
+    aliases = {base}
+
+    # Allow selecting cameras via their numeric suffix (e.g. ``00_16``)
+    for prefix in ("hd_", "vga_", "kinect_", "mono_", "optical_"):
+        if base.startswith(prefix):
+            aliases.add(base[len(prefix) :])
+
+    # Support short forms such as ``cam00`` → ``00``.
+    if base.startswith("cam"):
+        aliases.add(base[3:])
+
+    clean_aliases = {
+        alias.strip("_")
+        for alias in aliases
+        if alias.strip("_")
+    }
+    return sorted(clean_aliases)
 
 
 def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
@@ -162,6 +195,7 @@ def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
         calib = json.load(f)
 
     cameras: Dict[str, PanopticCamera] = {}
+    alias_priority: Dict[str, int] = {}
     entries: List[dict] = []
 
     if "cameras" in calib:
@@ -196,7 +230,13 @@ def load_panoptic_calibration(calib_path: Path) -> Dict[str, PanopticCamera]:
             dist=np.asarray(entry.get("dist", [0, 0, 0, 0, 0]), dtype=np.float32),
             resolution=(int(resolution[0]), int(resolution[1])),
         )
-        cameras[_normalise_camera_key(name)] = cam
+        priority = _camera_family_priority(name)
+        for alias in _camera_aliases(name):
+            current_priority = alias_priority.get(alias)
+            if current_priority is not None and current_priority > priority:
+                continue
+            alias_priority[alias] = priority
+            cameras[alias] = cam
     if not cameras:
         raise ValueError("No camera calibration entries found")
     return cameras
@@ -428,10 +468,18 @@ def evaluate_sequence(
         on_log(f"[info] Saving pose visualisations to {vis_dir}")
 
     def resolve_camera(name: str) -> PanopticCamera:
-        key = _normalise_camera_key(name)
-        if key not in cameras:
-            raise KeyError(f"Camera '{name}' not found in calibration file {calib_path}")
-        return cameras[key]
+        key = str(name).lower().strip()
+        if key in cameras:
+            return cameras[key]
+
+        if key.startswith("hd_") and key[3:] in cameras:
+            return cameras[key[3:]]
+        if not key.startswith("hd_"):
+            hd_key = f"hd_{key}".strip("_")
+            if hd_key in cameras:
+                return cameras[hd_key]
+
+        raise KeyError(f"Camera '{name}' not found in calibration file {calib_path}")
 
     left_cam = resolve_camera(left_camera)
     right_cam = resolve_camera(right_camera) if right_camera else None
