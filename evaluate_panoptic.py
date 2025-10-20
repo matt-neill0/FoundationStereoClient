@@ -205,7 +205,11 @@ def _frame_id_from_path(image_path: Path) -> str:
     stem = image_path.stem
     digits = "".join(ch for ch in stem if ch.isdigit())
     if digits:
-        return digits.zfill(8)
+        # Some Panoptic image dumps insert separators (e.g. frame_000000000999)
+        # leading to more than eight digits in the stem.  The annotation JSONs
+        # are consistently zero-padded to eight characters, so trim to the last
+        # eight digits before zero-filling to avoid requesting 12-digit files.
+        return digits[-8:].zfill(8)
     return stem
 
 
@@ -421,6 +425,12 @@ def evaluate_sequence(
         f" with PCK threshold {threshold_px:.1f} px"
     )
 
+    skipped_missing_annotations = 0
+    frames_with_annotations = 0
+    frames_with_ground_truth = 0
+    frames_with_predictions = 0
+    frames_with_matches = 0
+
     for idx_pos, frame_idx in enumerate(frame_indices):
         left_path = left_frames[frame_idx]
         right_path = right_frames[frame_idx] if right_cam is not None else None
@@ -450,7 +460,18 @@ def evaluate_sequence(
 
         frame_id = _frame_id_from_path(left_path)
         frame_json = annot_dir / f"body3DScene_{frame_id}.json"
+        if not frame_json.exists():
+            if skipped_missing_annotations < 5:
+                on_log(
+                    f"[warn] Missing annotation file {frame_json.name}; skipping frame"
+                )
+            skipped_missing_annotations += 1
+            continue
+
         gt_poses = load_frame_annotations(frame_json, left_cam)
+        frames_with_annotations += 1
+        if gt_poses:
+            frames_with_ground_truth += 1
 
         metrics.total_gt_people += len(gt_poses)
         for gt_pose in gt_poses:
@@ -458,6 +479,9 @@ def evaluate_sequence(
 
         matches = _match_poses(poses, gt_poses)
         matched_preds: set[int] = set()
+        accepted_match = False
+        if poses:
+            frames_with_predictions += 1
         distance_gate = threshold_px * 2.0
         for pred_idx, gt_idx, avg_dist in matches:
             if avg_dist > distance_gate:
@@ -467,6 +491,10 @@ def evaluate_sequence(
             metrics.matched_people += 1
             metrics.update_pair(pred, gt, threshold_px)
             matched_preds.add(pred_idx)
+            accepted_match = True
+
+        if accepted_match:
+            frames_with_matches += 1
 
         metrics.false_positives += max(len(poses) - len(matched_preds), 0)
 
@@ -476,6 +504,34 @@ def evaluate_sequence(
                 f"[info] Processed {idx_pos+1}/{len(frame_indices)} frames → "
                 f"PCK={summary['pck']*100:.1f}% MPE={summary['mean_pixel_error']:.1f}px"
             )
+
+    if skipped_missing_annotations:
+        on_log(
+            f"[warn] Skipped {skipped_missing_annotations} frame(s) with missing annotations"
+        )
+
+    on_log(
+        "[info] Frame coverage: "
+        f"{frames_with_annotations} annotation files / {frames_with_ground_truth} with people / "
+        f"{frames_with_predictions} with detections / {frames_with_matches} matched"
+    )
+
+    if frames_with_annotations == 0:
+        on_log(
+            "[error] No ground-truth annotations were loaded; check dataset paths and frame numbering"
+        )
+    elif frames_with_ground_truth == 0:
+        on_log(
+            "[warn] Annotation files were present but contained no people; accuracy metrics will remain zero"
+        )
+    elif frames_with_predictions == 0:
+        on_log(
+            "[warn] Pose backend did not return any detections on annotated frames; accuracy will be zero"
+        )
+    elif frames_with_matches == 0:
+        on_log(
+            "[warn] Detections never satisfied the distance gate; try increasing --pck-threshold or review pose quality"
+        )
 
     return metrics
 
